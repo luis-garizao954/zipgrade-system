@@ -11,45 +11,50 @@ async def procesar_pdf_zipgrade(contenido: bytes) -> list:
         if not texto:
             continue
         
-        nombre = None
         puntos = None
         posibles = None
         porcentaje = None
         
-        lineas = texto.split('\n')
-        for linea in lineas:
-            if 'Puntos obtenidos:' in linea:
-                m = re.search(r'Puntos obtenidos:\s*([\d.]+)', linea)
-                if m:
-                    puntos = float(m.group(1))
-            elif 'Puntos posibles' in linea:
-                m = re.search(r'Puntos posibles\s*([\d.]+)', linea)
-                if m:
-                    posibles = float(m.group(1))
-            elif '% C correctas:' in linea:
-                m = re.search(r'%\s*C correctas:\s*([\d.]+)', linea)
-                if m:
-                    porcentaje = float(m.group(1))
+        # Buscar datos numéricos
+        m = re.search(r'Puntos obtenidos[:\s]+([\d.]+)', texto)
+        if m:
+            puntos = float(m.group(1))
         
-        palabras_clave = ['Estudiante:', 'Quiz:', 'Puntos', '%', '#', 'Informe', 'Llave']
+        m = re.search(r'Puntos posibles[:\s]+([\d.]+)', texto)
+        if m:
+            posibles = float(m.group(1))
+        
+        m = re.search(r'%\s*C correctas[:\s]+([\d.]+)', texto)
+        if m:
+            porcentaje = float(m.group(1))
+        
+        # Buscar nombre — aparece al inicio del texto antes de "Estudiante"
+        nombre = "Desconocido"
+        lineas = [l.strip() for l in texto.split('\n') if l.strip()]
+        
+        palabras_excluir = ['estudiante', 'quiz', 'puntos', 'informe', 'llave', 
+                           'zipgrade', '#', '%', 'poss', 'stu', 'pts']
+        
         for linea in lineas:
-            linea = linea.strip()
-            if not linea or len(linea) < 3 or len(linea) > 60:
-                continue
-            if any(p in linea for p in palabras_clave):
+            linea_lower = linea.lower()
+            if any(p in linea_lower for p in palabras_excluir):
                 continue
             if re.match(r'^\d', linea):
                 continue
-            nombre = linea
-            break
+            if len(linea) < 3 or len(linea) > 60:
+                continue
+            # Verificar que tiene al menos una letra
+            if re.search(r'[a-zA-ZáéíóúñÁÉÍÓÚÑ]', linea):
+                nombre = linea
+                break
         
-        if puntos is not None:
-            nota = round((puntos / posibles) * 5.0, 1) if posibles else 0
+        if puntos is not None and posibles is not None:
+            nota = round((puntos / posibles) * 5.0, 1) if posibles > 0 else 0
             resultados.append({
-                "nombre": nombre or "Desconocido",
+                "nombre": nombre,
                 "puntos": puntos,
                 "posibles": posibles,
-                "porcentaje": porcentaje,
+                "porcentaje": porcentaje or 0,
                 "nota": nota
             })
     
