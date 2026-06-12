@@ -2,7 +2,7 @@ import re
 import anthropic
 import base64
 import os
-from pypdf import PdfReader, PdfWriter
+from pypdf import PdfReader
 import io
 
 ANTHROPIC_KEY = os.getenv("ANTHROPIC_API_KEY", "")
@@ -34,13 +34,11 @@ async def procesar_pdf_zipgrade(contenido: bytes) -> list:
         if puntos is None or posibles is None:
             continue
         
-        # Extraer imagen de la pagina para leer nombre con Vision
         nombre = f"Estudiante_{i+1}"
         try:
             import fitz
             doc = fitz.open(stream=contenido, filetype="pdf")
             pag = doc[i]
-            # Recortar solo la parte superior donde esta el nombre
             rect = fitz.Rect(0, 0, pag.rect.width, pag.rect.height * 0.35)
             clip = pag.get_pixmap(matrix=fitz.Matrix(2, 2), clip=rect)
             img_b64 = base64.b64encode(clip.tobytes("png")).decode()
@@ -56,7 +54,7 @@ async def procesar_pdf_zipgrade(contenido: bytes) -> list:
             )
             nombre = resp.content[0].text.strip()
         except Exception as e:
-            nombre = f"Estudiante_{i+1}"
+            nombre = f"ERR:{str(e)[:40]}"
         
         nota = round((puntos / posibles) * 5.0, 1) if posibles > 0 else 0
         resultados.append({
