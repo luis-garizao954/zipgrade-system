@@ -6,41 +6,51 @@ async def procesar_pdf_zipgrade(contenido: bytes) -> list:
     reader = PdfReader(io.BytesIO(contenido))
     resultados = []
     
-    for i, page in enumerate(reader.pages):
+    for page in reader.pages:
         texto = page.extract_text()
         if not texto:
             continue
         
+        nombre = None
         puntos = None
         posibles = None
         porcentaje = None
         
-        m = re.search(r'Puntos obtenidos[:\s]+([\d.]+)', texto)
-        if m:
-            puntos = float(m.group(1))
+        lineas = texto.split('\n')
+        for linea in lineas:
+            if 'Puntos obtenidos:' in linea:
+                m = re.search(r'Puntos obtenidos:\s*([\d.]+)', linea)
+                if m:
+                    puntos = float(m.group(1))
+            elif 'Puntos posibles' in linea:
+                m = re.search(r'Puntos posibles\s*([\d.]+)', linea)
+                if m:
+                    posibles = float(m.group(1))
+            elif '% C correctas:' in linea:
+                m = re.search(r'%\s*C correctas:\s*([\d.]+)', linea)
+                if m:
+                    porcentaje = float(m.group(1))
         
-        m = re.search(r'Puntos posibles[:\s]+([\d.]+)', texto)
-        if m:
-            posibles = float(m.group(1))
+        palabras_clave = ['Estudiante:', 'Quiz:', 'Puntos', '%', '#', 'Informe', 'Llave']
+        for linea in lineas:
+            linea = linea.strip()
+            if not linea or len(linea) < 3 or len(linea) > 60:
+                continue
+            if any(p in linea for p in palabras_clave):
+                continue
+            if re.match(r'^\d', linea):
+                continue
+            nombre = linea
+            break
         
-        m = re.search(r'%\s*C correctas[:\s]+([\d.]+)', texto)
-        if m:
-            porcentaje = float(m.group(1))
-        
-        # Extraer todas las lineas del texto como resumen
-        lineas = [l.strip() for l in texto.split('\n') if l.strip()]
-        resumen = " | ".join(lineas[:8])
-        nombre = f"PAG{i+1}: {resumen[:200]}"
-        
-        if puntos is not None and posibles is not None:
-            nota = round((puntos / posibles) * 5.0, 1) if posibles > 0 else 0
+        if puntos is not None:
+            nota = round((puntos / posibles) * 5.0, 1) if posibles else 0
             resultados.append({
-                "nombre": nombre,
+                "nombre": nombre or "Desconocido",
                 "puntos": puntos,
                 "posibles": posibles,
-                "porcentaje": porcentaje or 0,
-                "nota": nota,
-                "pagina": i+1
+                "porcentaje": porcentaje,
+                "nota": nota
             })
     
     return resultados
