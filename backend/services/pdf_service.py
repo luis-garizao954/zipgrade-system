@@ -27,10 +27,15 @@ async def procesar_pdf_zipgrade(contenido: bytes) -> list:
         if m:
             porcentaje = float(m.group(1))
         
+        # Extraer todas las lineas del texto como resumen
+        lineas = [l.strip() for l in texto.split('\n') if l.strip()]
+        resumen = " | ".join(lineas[:8])
+        nombre = f"PAG{i+1}: {resumen[:200]}"
+        
         if puntos is not None and posibles is not None:
             nota = round((puntos / posibles) * 5.0, 1) if posibles > 0 else 0
             resultados.append({
-                "nombre": f"Pagina_{i+1}",
+                "nombre": nombre,
                 "puntos": puntos,
                 "posibles": posibles,
                 "porcentaje": porcentaje or 0,
