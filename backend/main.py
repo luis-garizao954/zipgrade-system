@@ -8,8 +8,8 @@ from backend.services.suscripcion_service import (
     profe_activo, estudiante_activo, activar_profe, activar_estudiante,
     desactivar_profe, desactivar_estudiante
 )
-from datetime import date
-import uuid, os, httpx, base64, io, anthropic
+from backend.services.pdf_service import procesar_pdf_zipgrade
+import uuid, os, httpx, io
 
 app = FastAPI(title="ZipGrade System API", version="1.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -21,7 +21,6 @@ SessionLocal = sessionmaker(bind=engine)
 BOT_PROFE_TOKEN = os.getenv("BOT_PROFE_TOKEN", "")
 BOT_ESTUDIANTE_TOKEN = os.getenv("BOT_ESTUDIANTE_TOKEN", "")
 BASE_URL = os.getenv("RAILWAY_PUBLIC_DOMAIN", "")
-ANTHROPIC_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 
 profe_estado = {}
 
@@ -130,10 +129,8 @@ async def webhook_profe(request: Request, db: Session = Depends(get_db)):
             await send_message(BOT_PROFE_TOKEN, chat_id, "¿A qué curso pertenece este quiz?", reply_markup=botones)
 
     elif document and document.get("file_name", "").endswith(".pdf"):
-        estado_profe = profe_estado.get(telegram_id, {})
-        curso_id = estado_profe.get("curso_id")
         await send_message(BOT_PROFE_TOKEN, chat_id,
-            "📎 PDF recibido. Procesando con IA...\n\n⏳ Esto puede tardar 1-2 minutos.")
+            "📎 PDF recibido. Procesando...\n\n⏳ Esto puede tardar unos segundos.")
         try:
             file_id = document.get("file_id")
             async with httpx.AsyncClient(timeout=60) as client:
@@ -143,40 +140,14 @@ async def webhook_profe(request: Request, db: Session = Depends(get_db)):
                 pdf_r = await client.get(f"https://api.telegram.org/file/bot{BOT_PROFE_TOKEN}/{file_path}")
                 pdf_bytes = pdf_r.content
 
-            from pypdf import PdfReader, PdfWriter
-            import fitz
+            resultados_lista = await procesar_pdf_zipgrade(pdf_bytes)
+            total = len(resultados_lista)
 
-            reader = PdfReader(io.BytesIO(pdf_bytes))
-            total = len(reader.pages)
-            ac = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
-            resultados_lista = []
-
-            for i in range(total):
-                writer = PdfWriter()
-                writer.add_page(reader.pages[i])
-                buf = io.BytesIO()
-                writer.write(buf)
-                pagina_bytes = buf.getvalue()
-                try:
-                    doc = fitz.open(stream=pagina_bytes, filetype="pdf")
-                    pix = doc[0].get_pixmap(matrix=fitz.Matrix(2, 2))
-                    img_b64 = base64.b64encode(pix.tobytes("png")).decode()
-                    resp = ac.messages.create(
-                        model="claude-opus-4-6", max_tokens=100,
-                        messages=[{"role": "user", "content": [
-                            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": img_b64}},
-                            {"type": "text", "text": "Busca el apellido escrito a mano en esta hoja de examen. Responde SOLO el apellido, nada mas."}
-                        ]}])
-                    apellido = resp.content[0].text.strip()
-                except Exception as e:
-                    apellido = f"Pagina_{i+1}"
-                resultados_lista.append({"pagina": i+1, "apellido": apellido})
-
-            resumen = "\n".join([f"Pag {r['pagina']}: <b>{r['apellido']}</b>" for r in resultados_lista])
+            resumen = "\n".join([f"• <b>{r['nombre']}</b>: {r['nota']}/5.0 ({r['porcentaje']}%)" for r in resultados_lista])
             await send_message(BOT_PROFE_TOKEN, chat_id,
-                f"✅ PDF procesado: <b>{total} estudiantes</b>\n\n{resumen}\n\n¿Los apellidos son correctos? Responde <b>OK</b> para confirmar.")
+                f"✅ PDF procesado: <b>{total} estudiantes</b>\n\n{resumen}\n\nResponde <b>OK</b> para confirmar y guardar.")
+            profe_estado[telegram_id] = profe_estado.get(telegram_id, {})
             profe_estado[telegram_id]["resultados"] = resultados_lista
-            profe_estado[telegram_id]["pdf_bytes"] = pdf_bytes
 
         except Exception as e:
             await send_message(BOT_PROFE_TOKEN, chat_id, f"❌ Error procesando PDF: {str(e)}")
@@ -195,7 +166,7 @@ async def webhook_profe(request: Request, db: Session = Depends(get_db)):
                 f"✅ Curso <b>{nom} {grado}</b> creado!\n\nUsa /subirquiz para subir un PDF.")
         elif text.upper() == "OK" and estado_profe.get("resultados"):
             await send_message(BOT_PROFE_TOKEN, chat_id,
-                "✅ Resultados confirmados y guardados. Los estudiantes ya pueden consultar sus notas.")
+                "✅ Resultados confirmados. Los estudiantes ya pueden consultar sus notas.")
             profe_estado[telegram_id] = {}
         else:
             await send_message(BOT_PROFE_TOKEN, chat_id,
@@ -310,18 +281,17 @@ def cursos_by_profe(telegram_id: int, db: Session = Depends(get_db)):
     cursos = db.query(Curso).filter(Curso.profe_id == profe.id).all()
     return [{"id": str(c.id), "nombre": c.nombre, "grado": c.grado} for c in cursos]
 
+@app.post("/quizzes/procesar-pdf")
+async def procesar_pdf_endpoint(archivo: UploadFile = File(...), curso_id: str = Form(...), db: Session = Depends(get_db)):
+    contenido = await archivo.read()
+    resultados = await procesar_pdf_zipgrade(contenido)
+    return {"resultados": resultados, "total": len(resultados)}
+
 @app.get("/resultados/historial/{estudiante_id}")
 def historial_estudiante(estudiante_id: str, db: Session = Depends(get_db)):
     return db.query(Resultado).filter(
         Resultado.estudiante_id == estudiante_id,
         Resultado.confirmado == True).all()
-
-@app.get("/resultados/{resultado_id}")
-def get_resultado(resultado_id: str, db: Session = Depends(get_db)):
-    r = db.query(Resultado).filter(Resultado.id == resultado_id).first()
-    if not r:
-        raise HTTPException(status_code=404, detail="No encontrado")
-    return r
 
 @app.post("/admin/activar-profe/{telegram_id}")
 def admin_activar_profe(telegram_id: int, db: Session = Depends(get_db)):
