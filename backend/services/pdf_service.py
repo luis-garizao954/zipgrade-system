@@ -40,7 +40,6 @@ async def procesar_pdf_zipgrade(contenido: bytes) -> list:
         nombre = f"Estudiante_{i+1}"
         try:
             pag = doc[i]
-            # Solo la franja superior izquierda donde esta el nombre
             ancho = pag.rect.width
             alto = pag.rect.height
             rect = fitz.Rect(0, alto * 0.05, ancho * 0.55, alto * 0.25)
@@ -62,7 +61,7 @@ async def procesar_pdf_zipgrade(contenido: bytes) -> list:
             )
             nombre = resp.content[0].text.strip()
         except Exception as e:
-            nombre = f"ERR:{str(e)[:40]}"
+            nombre = f"ERR:{repr(e)[:80]}"
         
         nota = round((puntos / posibles) * 5.0, 1) if posibles > 0 else 0
         resultados.append({
