@@ -12,6 +12,9 @@ async def procesar_pdf_zipgrade(contenido: bytes) -> list:
     resultados = []
     ac = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
     
+    import fitz
+    doc = fitz.open(stream=contenido, filetype="pdf")
+    
     for i, page in enumerate(reader.pages):
         texto = page.extract_text() or ""
         
@@ -36,20 +39,25 @@ async def procesar_pdf_zipgrade(contenido: bytes) -> list:
         
         nombre = f"Estudiante_{i+1}"
         try:
-            import fitz
-            doc = fitz.open(stream=contenido, filetype="pdf")
             pag = doc[i]
-            rect = fitz.Rect(0, 0, pag.rect.width, pag.rect.height * 0.35)
-            clip = pag.get_pixmap(matrix=fitz.Matrix(2, 2), clip=rect)
-            img_b64 = base64.b64encode(clip.tobytes("png")).decode()
-            doc.close()
+            # Solo la franja superior izquierda donde esta el nombre
+            ancho = pag.rect.width
+            alto = pag.rect.height
+            rect = fitz.Rect(0, alto * 0.05, ancho * 0.55, alto * 0.25)
+            clip = pag.get_pixmap(matrix=fitz.Matrix(3, 3), clip=rect)
+            img_bytes = clip.tobytes("jpeg")
+            img_b64 = base64.standard_b64encode(img_bytes).decode("utf-8")
             
             resp = ac.messages.create(
                 model="claude-haiku-4-5-20251001",
-                max_tokens=50,
+                max_tokens=60,
                 messages=[{"role": "user", "content": [
-                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": img_b64}},
-                    {"type": "text", "text": "Lee el nombre escrito a mano en esta imagen de examen. Responde SOLO el nombre, nada mas. Si no ves nombre claro responde Desconocido."}
+                    {"type": "image", "source": {
+                        "type": "base64",
+                        "media_type": "image/jpeg",
+                        "data": img_b64
+                    }},
+                    {"type": "text", "text": "What name is handwritten in this image? Reply with ONLY the name, nothing else."}
                 ]}]
             )
             nombre = resp.content[0].text.strip()
@@ -65,4 +73,5 @@ async def procesar_pdf_zipgrade(contenido: bytes) -> list:
             "nota": nota
         })
     
+    doc.close()
     return resultados
