@@ -63,5 +63,7 @@ class Resultado(Base):
     pagina = Column(Integer)
     imagen_url = Column(Text)
     quiz_pdf_url = Column(Text)
+    curso_nombre = Column(Text)
+    quiz_nombre = Column(Text)
     confirmado = Column(Boolean, default=False)
     created_at = Column(DateTime, server_default=func.now())
