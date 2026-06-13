@@ -38,6 +38,13 @@ async def send_message(token, chat_id, text, reply_markup=None):
     async with httpx.AsyncClient() as client:
         await client.post(f"https://api.telegram.org/bot{token}/sendMessage", json=payload)
 
+async def send_photo(token, chat_id, photo_url, caption=""):
+    async with httpx.AsyncClient() as client:
+        await client.post(
+            f"https://api.telegram.org/bot{token}/sendPhoto",
+            json={"chat_id": chat_id, "photo": photo_url, "caption": caption}
+        )
+
 @app.on_event("startup")
 async def set_webhooks():
     if BOT_PROFE_TOKEN and BASE_URL:
@@ -189,7 +196,6 @@ async def webhook_profe(request: Request, db: Session = Depends(get_db)):
                 except:
                     continue
 
-            # GUARDAR EN BASE DE DATOS INMEDIATAMENTE
             guardados = 0
             for r in resultados:
                 try:
@@ -201,6 +207,7 @@ async def webhook_profe(request: Request, db: Session = Depends(get_db)):
                         posibles=r["posibles"],
                         porcentaje=r["porcentaje"],
                         pagina=r.get("pagina", 0),
+                        imagen_url=r.get("imagen_url", ""),
                         confirmado=True
                     )
                     db.add(nuevo_r)
@@ -258,10 +265,12 @@ async def webhook_estudiante(request: Request, db: Session = Depends(get_db)):
             await send_message(BOT_ESTUDIANTE_TOKEN, chat_id,
                 f"📭 No encontré resultados para <b>{estudiante.nombre}</b>.\n\nEscribe tu nombre completo como aparece en el examen.")
         else:
-            msg = f"📊 <b>Resultados para {estudiante.nombre}:</b>\n\n"
             for r in resultados:
-                msg += f"📝 Nota: <b>{r.nota}/5.0</b> ({r.porcentaje}%)\n"
-            await send_message(BOT_ESTUDIANTE_TOKEN, chat_id, msg)
+                msg = f"📊 <b>{r.nombre_temp}</b>\n📝 Nota: <b>{r.nota}/5.0</b> ({r.porcentaje}%)"
+                await send_message(BOT_ESTUDIANTE_TOKEN, chat_id, msg)
+                if r.imagen_url:
+                    await send_photo(BOT_ESTUDIANTE_TOKEN, chat_id, r.imagen_url,
+                        "📋 Tu hoja de respuestas — los círculos rojos son las incorrectas")
 
     elif text and not text.startswith("/"):
         nombre_buscar = text.strip()
@@ -273,10 +282,12 @@ async def webhook_estudiante(request: Request, db: Session = Depends(get_db)):
             await send_message(BOT_ESTUDIANTE_TOKEN, chat_id,
                 f"❌ No encontré resultados para <b>{nombre_buscar}</b>.\n\nIntenta con tu apellido o como aparece en el examen.")
         else:
-            msg = f"📊 <b>Resultados para {nombre_buscar}:</b>\n\n"
             for r in resultados:
-                msg += f"📝 Nota: <b>{r.nota}/5.0</b> ({r.porcentaje}%)\n"
-            await send_message(BOT_ESTUDIANTE_TOKEN, chat_id, msg)
+                msg = f"📊 <b>{r.nombre_temp}</b>\n📝 Nota: <b>{r.nota}/5.0</b> ({r.porcentaje}%)"
+                await send_message(BOT_ESTUDIANTE_TOKEN, chat_id, msg)
+                if r.imagen_url:
+                    await send_photo(BOT_ESTUDIANTE_TOKEN, chat_id, r.imagen_url,
+                        "📋 Tu hoja de respuestas — los círculos rojos son las incorrectas")
 
     return {"ok": True}
 
