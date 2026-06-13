@@ -61,5 +61,6 @@ class Resultado(Base):
     posibles = Column(Numeric(6, 2))
     porcentaje = Column(Numeric(5, 2))
     pagina = Column(Integer)
+    imagen_url = Column(Text)
     confirmado = Column(Boolean, default=False)
     created_at = Column(DateTime, server_default=func.now())
