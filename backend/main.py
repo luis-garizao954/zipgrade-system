@@ -22,8 +22,6 @@ BOT_PROFE_TOKEN = os.getenv("BOT_PROFE_TOKEN", "")
 BOT_ESTUDIANTE_TOKEN = os.getenv("BOT_ESTUDIANTE_TOKEN", "")
 BASE_URL = os.getenv("RAILWAY_PUBLIC_DOMAIN", "")
 
-profe_estado = {}
-
 def get_db():
     db = SessionLocal()
     try:
@@ -68,7 +66,6 @@ async def webhook_profe(request: Request, db: Session = Depends(get_db)):
             curso_id = cb_data.replace("curso_", "")
             curso = db.query(Curso).filter(Curso.id == curso_id).first()
             if curso:
-                profe_estado[telegram_id] = {"curso_id": curso_id, "curso_nombre": curso.nombre}
                 await send_message(BOT_PROFE_TOKEN, chat_id,
                     f"📚 Curso: <b>{curso.nombre} - {curso.grado}</b>\n\nAhora envíame el PDF de ZipGrade.")
         return {"ok": True}
@@ -110,8 +107,7 @@ async def webhook_profe(request: Request, db: Session = Depends(get_db)):
             return {"ok": True}
         cursos = db.query(Curso).filter(Curso.profe_id == profe.id).all()
         if not cursos:
-            await send_message(BOT_PROFE_TOKEN, chat_id,
-                "No tienes cursos aun. Usa /nuevocurso para crear uno.")
+            await send_message(BOT_PROFE_TOKEN, chat_id, "No tienes cursos aun. Usa /nuevocurso para crear uno.")
         else:
             lista = "\n".join([f"📚 {c.nombre} - {c.grado}" for c in cursos])
             await send_message(BOT_PROFE_TOKEN, chat_id, f"Tus cursos:\n\n{lista}")
@@ -120,7 +116,14 @@ async def webhook_profe(request: Request, db: Session = Depends(get_db)):
         if not profe or not profe.activo:
             await send_message(BOT_PROFE_TOKEN, chat_id, "❌ Necesitas suscripcion activa.")
             return {"ok": True}
-        profe_estado[telegram_id] = {"esperando": "nombre_curso"}
+        # Guardar estado en DB como resultado temporal con nombre especial
+        marcador = db.query(Resultado).filter(
+            Resultado.nombre_temp == f"__estado__{telegram_id}__esperando_curso"
+        ).first()
+        if not marcador:
+            db.add(Resultado(id=uuid.uuid4(), nombre_temp=f"__estado__{telegram_id}__esperando_curso",
+                confirmado=False))
+            db.commit()
         await send_message(BOT_PROFE_TOKEN, chat_id,
             "✏️ Escribe el nombre y grado del curso en este formato:\n\n<b>Matematicas 9B</b>")
 
@@ -150,33 +153,63 @@ async def webhook_profe(request: Request, db: Session = Depends(get_db)):
             resultados_lista = await procesar_pdf_zipgrade(pdf_bytes)
             total = len(resultados_lista)
 
+            # GUARDAR EN DB INMEDIATAMENTE con nombre temporal PAGx
+            # Primero borrar resultados no confirmados anteriores de este profe
+            db.query(Resultado).filter(
+                Resultado.nombre_temp.like("PAG%"),
+                Resultado.confirmado == False
+            ).delete(synchronize_session=False)
+            db.commit()
+
+            for r in resultados_lista:
+                nuevo_r = Resultado(
+                    id=uuid.uuid4(),
+                    nombre_temp=r["nombre"],
+                    nota=r["nota"],
+                    puntos=r["puntos"],
+                    posibles=r["posibles"],
+                    porcentaje=r["porcentaje"],
+                    pagina=r.get("pagina", 0),
+                    imagen_url=r.get("imagen_url", ""),
+                    confirmado=False
+                )
+                db.add(nuevo_r)
+            db.commit()
+
             resumen = "\n".join([f"• <b>{r['nombre']}</b>: {r['nota']}/5.0 ({r['porcentaje']}%)" for r in resultados_lista])
             await send_message(BOT_PROFE_TOKEN, chat_id,
                 f"✅ PDF procesado: <b>{total} estudiantes</b>\n\n{resumen}\n\n"
                 f"📝 Ahora pega la lista de nombres con el formato:\n"
                 f"PAG1: Nombre Apellido\nPAG2: Nombre Apellido\n...")
-            profe_estado[telegram_id] = {"resultados": resultados_lista}
 
         except Exception as e:
             await send_message(BOT_PROFE_TOKEN, chat_id, f"❌ Error procesando PDF: {str(e)}")
 
     elif text and not text.startswith("/"):
-        estado_profe = profe_estado.get(telegram_id, {})
+        # Verificar si está esperando nombre de curso
+        marcador = db.query(Resultado).filter(
+            Resultado.nombre_temp == f"__estado__{telegram_id}__esperando_curso"
+        ).first()
 
-        if estado_profe.get("esperando") == "nombre_curso" and profe and profe.activo:
+        if marcador and profe and profe.activo:
             partes = text.rsplit(" ", 1)
             nom = partes[0]
             grado = partes[1] if len(partes) > 1 else ""
             nuevo_curso = Curso(id=uuid.uuid4(), profe_id=profe.id, nombre=nom, grado=grado)
             db.add(nuevo_curso)
+            db.delete(marcador)
             db.commit()
-            profe_estado[telegram_id] = {}
             await send_message(BOT_PROFE_TOKEN, chat_id,
                 f"✅ Curso <b>{nom} {grado}</b> creado!\n\nUsa /subirquiz para subir un PDF.")
 
         elif "PAG" in text[:5]:
-            resultados = estado_profe.get("resultados", [])
-            if not resultados:
+            # Buscar resultados no confirmados en DB
+            resultados_db = db.query(Resultado).filter(
+                Resultado.nombre_temp.like("PAG%"),
+                Resultado.confirmado == False
+            ).all()
+
+            if not resultados_db:
                 await send_message(BOT_PROFE_TOKEN, chat_id,
                     "❌ No encontré el PDF procesado. Por favor vuelve a enviar el PDF primero.")
                 return {"ok": True}
@@ -187,39 +220,20 @@ async def webhook_profe(request: Request, db: Session = Depends(get_db)):
                 try:
                     partes = linea.split(":")
                     num_pag = int(partes[0].replace("PAG", "").strip())
-                    nombre_parte = partes[1].split("-")[0].strip()
-                    for r in resultados:
-                        if r.get("pagina") == num_pag:
-                            r["nombre"] = nombre_parte
+                    nombre_real = partes[1].split("-")[0].strip()
+                    for r in resultados_db:
+                        if r.pagina == num_pag:
+                            r.nombre_temp = nombre_real
+                            r.confirmado = True
                             nombres_asignados += 1
                             break
                 except:
                     continue
-
-            guardados = 0
-            for r in resultados:
-                try:
-                    nuevo_r = Resultado(
-                        id=uuid.uuid4(),
-                        nombre_temp=r["nombre"],
-                        nota=r["nota"],
-                        puntos=r["puntos"],
-                        posibles=r["posibles"],
-                        porcentaje=r["porcentaje"],
-                        pagina=r.get("pagina", 0),
-                        imagen_url=r.get("imagen_url", ""),
-                        confirmado=True
-                    )
-                    db.add(nuevo_r)
-                    guardados += 1
-                except:
-                    pass
             db.commit()
-            profe_estado[telegram_id] = {}
 
-            resumen = "\n".join([f"• <b>{r['nombre']}</b>: {r['nota']}/5.0" for r in resultados])
+            resumen = "\n".join([f"• <b>{r.nombre_temp}</b>: {r.nota}/5.0" for r in resultados_db])
             await send_message(BOT_PROFE_TOKEN, chat_id,
-                f"✅ <b>{nombres_asignados} nombres asignados y {guardados} resultados guardados!</b>\n\n{resumen}\n\n"
+                f"✅ <b>{nombres_asignados} nombres asignados y guardados!</b>\n\n{resumen}\n\n"
                 f"✅ Los estudiantes ya pueden consultar sus notas.")
 
         else:
@@ -251,26 +265,7 @@ async def webhook_estudiante(request: Request, db: Session = Depends(get_db)):
                 f"👋 Hola <b>{nombre}</b>!\n\nBienvenido al sistema ZipGrade.\n\nEscribe tu nombre completo tal como aparece en tu examen para ver tu nota.")
         else:
             await send_message(BOT_ESTUDIANTE_TOKEN, chat_id,
-                f"✅ Hola <b>{estudiante.nombre}</b>!\n\nEscribe tu nombre completo para buscar tu nota, o usa /misnotas.")
-
-    elif text == "/misnotas":
-        if not estudiante:
-            await send_message(BOT_ESTUDIANTE_TOKEN, chat_id, "Primero escribe /start")
-            return {"ok": True}
-        resultados = db.query(Resultado).filter(
-            Resultado.nombre_temp.ilike(f"%{estudiante.nombre}%"),
-            Resultado.confirmado == True
-        ).all()
-        if not resultados:
-            await send_message(BOT_ESTUDIANTE_TOKEN, chat_id,
-                f"📭 No encontré resultados para <b>{estudiante.nombre}</b>.\n\nEscribe tu nombre completo como aparece en el examen.")
-        else:
-            for r in resultados:
-                msg = f"📊 <b>{r.nombre_temp}</b>\n📝 Nota: <b>{r.nota}/5.0</b> ({r.porcentaje}%)"
-                await send_message(BOT_ESTUDIANTE_TOKEN, chat_id, msg)
-                if r.imagen_url:
-                    await send_photo(BOT_ESTUDIANTE_TOKEN, chat_id, r.imagen_url,
-                        "📋 Tu hoja de respuestas — los círculos rojos son las incorrectas")
+                f"✅ Hola <b>{estudiante.nombre}</b>!\n\nEscribe tu nombre completo para buscar tu nota.")
 
     elif text and not text.startswith("/"):
         nombre_buscar = text.strip()
@@ -287,7 +282,7 @@ async def webhook_estudiante(request: Request, db: Session = Depends(get_db)):
                 await send_message(BOT_ESTUDIANTE_TOKEN, chat_id, msg)
                 if r.imagen_url:
                     await send_photo(BOT_ESTUDIANTE_TOKEN, chat_id, r.imagen_url,
-                        "📋 Tu hoja de respuestas — los círculos rojos son las incorrectas")
+                        "📋 Tu hoja de respuestas")
 
     return {"ok": True}
 
