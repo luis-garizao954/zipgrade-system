@@ -11,7 +11,7 @@ class Profe(Base):
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     telegram_id = Column(BigInteger, unique=True, nullable=False)
     nombre = Column(Text, nullable=False)
-    email = Column(Text, unique=True)
+    email = Column(Text)
     activo = Column(Boolean, default=False)
     suscripcion_hasta = Column(DateTime)
     created_at = Column(DateTime, server_default=func.now())
@@ -22,11 +22,10 @@ class Estudiante(Base):
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     telegram_id = Column(BigInteger, unique=True, nullable=False)
     nombre = Column(Text, nullable=False)
-    apellido = Column(Text, nullable=False)
+    apellido = Column(Text, default="")
     activo = Column(Boolean, default=False)
     suscripcion_hasta = Column(DateTime)
     created_at = Column(DateTime, server_default=func.now())
-    resultados = relationship("Resultado", back_populates="estudiante")
 
 class Curso(Base):
     __tablename__ = "cursos"
@@ -36,14 +35,11 @@ class Curso(Base):
     grado = Column(Text)
     created_at = Column(DateTime, server_default=func.now())
     profe = relationship("Profe", back_populates="cursos")
-    quizzes = relationship("Quiz", back_populates="curso", cascade="all, delete")
-    estudiantes = relationship("Estudiante", secondary="curso_estudiantes")
 
 class CursoEstudiante(Base):
     __tablename__ = "curso_estudiantes"
     curso_id = Column(UUID(as_uuid=True), ForeignKey("cursos.id", ondelete="CASCADE"), primary_key=True)
     estudiante_id = Column(UUID(as_uuid=True), ForeignKey("estudiantes.id", ondelete="CASCADE"), primary_key=True)
-    apellido_zipgrade = Column(Text)
 
 class Quiz(Base):
     __tablename__ = "quizzes"
@@ -53,31 +49,17 @@ class Quiz(Base):
     fecha = Column(Date, server_default=func.current_date())
     total_preguntas = Column(Integer, default=20)
     created_at = Column(DateTime, server_default=func.now())
-    curso = relationship("Curso", back_populates="quizzes")
-    resultados = relationship("Resultado", back_populates="quiz", cascade="all, delete")
 
 class Resultado(Base):
     __tablename__ = "resultados"
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    quiz_id = Column(UUID(as_uuid=True), ForeignKey("quizzes.id", ondelete="CASCADE"))
-    estudiante_id = Column(UUID(as_uuid=True), ForeignKey("estudiantes.id"))
-    apellido_detectado = Column(Text)
-    apellido_confirmado = Column(Text)
-    correctas = Column(Integer)
-    total = Column(Integer)
-    nota = Column(Numeric(3, 2))
-    pdf_url = Column(Text)
+    quiz_id = Column(UUID(as_uuid=True), nullable=True)
+    estudiante_id = Column(UUID(as_uuid=True), nullable=True)
+    nombre_temp = Column(Text)
+    nota = Column(Numeric(4, 2))
+    puntos = Column(Numeric(6, 2))
+    posibles = Column(Numeric(6, 2))
+    porcentaje = Column(Numeric(5, 2))
+    pagina = Column(Integer)
     confirmado = Column(Boolean, default=False)
     created_at = Column(DateTime, server_default=func.now())
-    quiz = relationship("Quiz", back_populates="resultados")
-    estudiante = relationship("Estudiante", back_populates="resultados")
-
-class Pago(Base):
-    __tablename__ = "pagos"
-    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    tipo = Column(Text, nullable=False)
-    referencia_id = Column(UUID(as_uuid=True), nullable=False)
-    monto = Column(Numeric(10, 2))
-    meses = Column(Integer, default=1)
-    fecha_pago = Column(DateTime, server_default=func.now())
-    metodo = Column(Text)
