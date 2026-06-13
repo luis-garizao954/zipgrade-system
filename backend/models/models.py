@@ -62,5 +62,6 @@ class Resultado(Base):
     porcentaje = Column(Numeric(5, 2))
     pagina = Column(Integer)
     imagen_url = Column(Text)
+    quiz_pdf_url = Column(Text)
     confirmado = Column(Boolean, default=False)
     created_at = Column(DateTime, server_default=func.now())
