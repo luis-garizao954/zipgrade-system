@@ -10,6 +10,7 @@ from backend.services.suscripcion_service import (
 )
 from backend.services.pdf_service import procesar_pdf_zipgrade
 import uuid, os, httpx, io
+import boto3
 
 app = FastAPI(title="ZipGrade System API", version="1.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -21,6 +22,11 @@ SessionLocal = sessionmaker(bind=engine)
 BOT_PROFE_TOKEN = os.getenv("BOT_PROFE_TOKEN", "")
 BOT_ESTUDIANTE_TOKEN = os.getenv("BOT_ESTUDIANTE_TOKEN", "")
 BASE_URL = os.getenv("RAILWAY_PUBLIC_DOMAIN", "")
+R2_ACCOUNT_ID = os.getenv("R2_ACCOUNT_ID", "")
+R2_ACCESS_KEY = os.getenv("R2_ACCESS_KEY", "")
+R2_SECRET_KEY = os.getenv("R2_SECRET_KEY", "")
+R2_BUCKET_NAME = os.getenv("R2_BUCKET_NAME", "zipgrade-pdfs")
+R2_PUBLIC_URL = os.getenv("R2_PUBLIC_URL", "")
 
 def get_db():
     db = SessionLocal()
@@ -28,6 +34,26 @@ def get_db():
         yield db
     finally:
         db.close()
+
+def subir_pdf_r2(pdf_bytes: bytes, nombre_archivo: str) -> str:
+    try:
+        client = boto3.client(
+            "s3",
+            endpoint_url=f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com",
+            aws_access_key_id=R2_ACCESS_KEY,
+            aws_secret_access_key=R2_SECRET_KEY,
+            region_name="auto"
+        )
+        client.put_object(
+            Bucket=R2_BUCKET_NAME,
+            Key=nombre_archivo,
+            Body=pdf_bytes,
+            ContentType="application/pdf"
+        )
+        return f"{R2_PUBLIC_URL}/{nombre_archivo}"
+    except Exception as e:
+        print(f"Error subiendo PDF a R2: {e}")
+        return ""
 
 async def send_message(token, chat_id, text, reply_markup=None):
     payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
@@ -41,6 +67,13 @@ async def send_photo(token, chat_id, photo_url, caption=""):
         await client.post(
             f"https://api.telegram.org/bot{token}/sendPhoto",
             json={"chat_id": chat_id, "photo": photo_url, "caption": caption}
+        )
+
+async def send_document_url(token, chat_id, doc_url, caption=""):
+    async with httpx.AsyncClient() as client:
+        await client.post(
+            f"https://api.telegram.org/bot{token}/sendDocument",
+            json={"chat_id": chat_id, "document": doc_url, "caption": caption}
         )
 
 @app.on_event("startup")
@@ -60,7 +93,6 @@ async def webhook_profe(request: Request, db: Session = Depends(get_db)):
 
     if callback:
         chat_id = callback.get("from", {}).get("id")
-        telegram_id = chat_id
         cb_data = callback.get("data", "")
         if cb_data.startswith("curso_"):
             curso_id = cb_data.replace("curso_", "")
@@ -116,13 +148,11 @@ async def webhook_profe(request: Request, db: Session = Depends(get_db)):
         if not profe or not profe.activo:
             await send_message(BOT_PROFE_TOKEN, chat_id, "❌ Necesitas suscripcion activa.")
             return {"ok": True}
-        # Guardar estado en DB como resultado temporal con nombre especial
         marcador = db.query(Resultado).filter(
             Resultado.nombre_temp == f"__estado__{telegram_id}__esperando_curso"
         ).first()
         if not marcador:
-            db.add(Resultado(id=uuid.uuid4(), nombre_temp=f"__estado__{telegram_id}__esperando_curso",
-                confirmado=False))
+            db.add(Resultado(id=uuid.uuid4(), nombre_temp=f"__estado__{telegram_id}__esperando_curso", confirmado=False))
             db.commit()
         await send_message(BOT_PROFE_TOKEN, chat_id,
             "✏️ Escribe el nombre y grado del curso en este formato:\n\n<b>Matematicas 9B</b>")
@@ -138,55 +168,73 @@ async def webhook_profe(request: Request, db: Session = Depends(get_db)):
             botones = {"inline_keyboard": [[{"text": f"📚 {c.nombre} - {c.grado}", "callback_data": f"curso_{c.id}"}] for c in cursos]}
             await send_message(BOT_PROFE_TOKEN, chat_id, "¿A qué curso pertenece este quiz?", reply_markup=botones)
 
-    elif document and document.get("file_name", "").endswith(".pdf"):
-        await send_message(BOT_PROFE_TOKEN, chat_id,
-            "📎 PDF recibido. Procesando...\n\n⏳ Esto puede tardar unos segundos.")
-        try:
-            file_id = document.get("file_id")
-            async with httpx.AsyncClient(timeout=60) as client:
-                r = await client.get(f"https://api.telegram.org/bot{BOT_PROFE_TOKEN}/getFile",
-                    params={"file_id": file_id})
-                file_path = r.json()["result"]["file_path"]
-                pdf_r = await client.get(f"https://api.telegram.org/file/bot{BOT_PROFE_TOKEN}/{file_path}")
-                pdf_bytes = pdf_r.content
+    elif document:
+        file_name = document.get("file_name", "")
+        file_id = document.get("file_id")
 
-            resultados_lista = await procesar_pdf_zipgrade(pdf_bytes)
-            total = len(resultados_lista)
+        async with httpx.AsyncClient(timeout=60) as client:
+            r = await client.get(f"https://api.telegram.org/bot{BOT_PROFE_TOKEN}/getFile",
+                params={"file_id": file_id})
+            file_path = r.json()["result"]["file_path"]
+            file_r = await client.get(f"https://api.telegram.org/file/bot{BOT_PROFE_TOKEN}/{file_path}")
+            file_bytes = file_r.content
 
-            # GUARDAR EN DB INMEDIATAMENTE con nombre temporal PAGx
-            # Primero borrar resultados no confirmados anteriores de este profe
-            db.query(Resultado).filter(
+        if file_name.endswith(".pdf"):
+            resultados_pendientes = db.query(Resultado).filter(
                 Resultado.nombre_temp.like("PAG%"),
                 Resultado.confirmado == False
-            ).delete(synchronize_session=False)
-            db.commit()
+            ).all()
 
-            for r in resultados_lista:
-                nuevo_r = Resultado(
-                    id=uuid.uuid4(),
-                    nombre_temp=r["nombre"],
-                    nota=r["nota"],
-                    puntos=r["puntos"],
-                    posibles=r["posibles"],
-                    porcentaje=r["porcentaje"],
-                    pagina=r.get("pagina", 0),
-                    imagen_url=r.get("imagen_url", ""),
-                    confirmado=False
-                )
-                db.add(nuevo_r)
-            db.commit()
+            if resultados_pendientes:
+                await send_message(BOT_PROFE_TOKEN, chat_id, "📄 PDF del quiz recibido. Subiendo...")
+                nombre_archivo = f"quizzes/{uuid.uuid4()}.pdf"
+                quiz_pdf_url = subir_pdf_r2(file_bytes, nombre_archivo)
 
-            resumen = "\n".join([f"• <b>{r['nombre']}</b>: {r['nota']}/5.0 ({r['porcentaje']}%)" for r in resultados_lista])
-            await send_message(BOT_PROFE_TOKEN, chat_id,
-                f"✅ PDF procesado: <b>{total} estudiantes</b>\n\n{resumen}\n\n"
-                f"📝 Ahora pega la lista de nombres con el formato:\n"
-                f"PAG1: Nombre Apellido\nPAG2: Nombre Apellido\n...")
+                if quiz_pdf_url:
+                    for r in resultados_pendientes:
+                        r.quiz_pdf_url = quiz_pdf_url
+                    db.commit()
+                    await send_message(BOT_PROFE_TOKEN, chat_id,
+                        "✅ PDF del quiz guardado.\n\nAhora pega la lista de nombres:\nPAG1: Nombre Apellido\nPAG2: Nombre Apellido...")
+                else:
+                    await send_message(BOT_PROFE_TOKEN, chat_id, "❌ Error subiendo el PDF. Intenta de nuevo.")
+            else:
+                await send_message(BOT_PROFE_TOKEN, chat_id,
+                    "📎 PDF de ZipGrade recibido. Procesando...\n\n⏳ Esto puede tardar unos segundos.")
+                try:
+                    resultados_lista = await procesar_pdf_zipgrade(file_bytes)
+                    total = len(resultados_lista)
 
-        except Exception as e:
-            await send_message(BOT_PROFE_TOKEN, chat_id, f"❌ Error procesando PDF: {str(e)}")
+                    db.query(Resultado).filter(
+                        Resultado.nombre_temp.like("PAG%"),
+                        Resultado.confirmado == False
+                    ).delete(synchronize_session=False)
+                    db.commit()
+
+                    for r in resultados_lista:
+                        nuevo_r = Resultado(
+                            id=uuid.uuid4(),
+                            nombre_temp=r["nombre"],
+                            nota=r["nota"],
+                            puntos=r["puntos"],
+                            posibles=r["posibles"],
+                            porcentaje=r["porcentaje"],
+                            pagina=r.get("pagina", 0),
+                            imagen_url=r.get("imagen_url", ""),
+                            confirmado=False
+                        )
+                        db.add(nuevo_r)
+                    db.commit()
+
+                    resumen = "\n".join([f"• <b>{r['nombre']}</b>: {r['nota']}/5.0 ({r['porcentaje']}%)" for r in resultados_lista])
+                    await send_message(BOT_PROFE_TOKEN, chat_id,
+                        f"✅ PDF procesado: <b>{total} estudiantes</b>\n\n{resumen}\n\n"
+                        f"📄 Ahora envíame el PDF del quiz (las preguntas) para que los estudiantes lo reciban.")
+
+                except Exception as e:
+                    await send_message(BOT_PROFE_TOKEN, chat_id, f"❌ Error procesando PDF: {str(e)}")
 
     elif text and not text.startswith("/"):
-        # Verificar si está esperando nombre de curso
         marcador = db.query(Resultado).filter(
             Resultado.nombre_temp == f"__estado__{telegram_id}__esperando_curso"
         ).first()
@@ -203,7 +251,6 @@ async def webhook_profe(request: Request, db: Session = Depends(get_db)):
                 f"✅ Curso <b>{nom} {grado}</b> creado!\n\nUsa /subirquiz para subir un PDF.")
 
         elif "PAG" in text[:5]:
-            # Buscar resultados no confirmados en DB
             resultados_db = db.query(Resultado).filter(
                 Resultado.nombre_temp.like("PAG%"),
                 Resultado.confirmado == False
@@ -283,6 +330,9 @@ async def webhook_estudiante(request: Request, db: Session = Depends(get_db)):
                 if r.imagen_url:
                     await send_photo(BOT_ESTUDIANTE_TOKEN, chat_id, r.imagen_url,
                         "📋 Tu hoja de respuestas")
+                if r.quiz_pdf_url:
+                    await send_document_url(BOT_ESTUDIANTE_TOKEN, chat_id, r.quiz_pdf_url,
+                        "📄 PDF del quiz")
 
     return {"ok": True}
 
