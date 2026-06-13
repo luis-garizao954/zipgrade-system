@@ -145,7 +145,9 @@ async def webhook_profe(request: Request, db: Session = Depends(get_db)):
 
             resumen = "\n".join([f"• <b>{r['nombre']}</b>: {r['nota']}/5.0 ({r['porcentaje']}%)" for r in resultados_lista])
             await send_message(BOT_PROFE_TOKEN, chat_id,
-                f"✅ PDF procesado: <b>{total} estudiantes</b>\n\n{resumen}\n\nResponde <b>OK</b> para confirmar y guardar.")
+                f"✅ PDF procesado: <b>{total} estudiantes</b>\n\n{resumen}\n\n"
+                f"📝 Ahora pega la lista de nombres con el formato:\n"
+                f"PAG1: Nombre Apellido\nPAG2: Nombre Apellido\n...")
             profe_estado[telegram_id] = profe_estado.get(telegram_id, {})
             profe_estado[telegram_id]["resultados"] = resultados_lista
 
@@ -164,10 +166,30 @@ async def webhook_profe(request: Request, db: Session = Depends(get_db)):
             profe_estado[telegram_id] = {}
             await send_message(BOT_PROFE_TOKEN, chat_id,
                 f"✅ Curso <b>{nom} {grado}</b> creado!\n\nUsa /subirquiz para subir un PDF.")
-        elif text.upper() == "OK" and estado_profe.get("resultados"):
+        elif estado_profe.get("resultados") and text.upper() == "OK":
             await send_message(BOT_PROFE_TOKEN, chat_id,
                 "✅ Resultados confirmados. Los estudiantes ya pueden consultar sus notas.")
             profe_estado[telegram_id] = {}
+        elif estado_profe.get("resultados") and "PAG" in text[:5]:
+            lineas = [l.strip() for l in text.split('\n') if l.strip() and l.strip()[:3] == "PAG"]
+            resultados = estado_profe.get("resultados", [])
+            nombres_asignados = 0
+            for linea in lineas:
+                try:
+                    partes = linea.split(":")
+                    num_pag = int(partes[0].replace("PAG", "").strip())
+                    nombre_parte = partes[1].split("-")[0].strip()
+                    for r in resultados:
+                        if r.get("pagina") == num_pag:
+                            r["nombre"] = nombre_parte
+                            nombres_asignados += 1
+                            break
+                except:
+                    continue
+            profe_estado[telegram_id]["resultados"] = resultados
+            resumen = "\n".join([f"• <b>{r['nombre']}</b>: {r['nota']}/5.0" for r in resultados])
+            await send_message(BOT_PROFE_TOKEN, chat_id,
+                f"✅ <b>{nombres_asignados} nombres asignados!</b>\n\n{resumen}\n\nResponde <b>OK</b> para confirmar y guardar.")
         else:
             await send_message(BOT_PROFE_TOKEN, chat_id,
                 "Comandos:\n/start\n/micursos\n/nuevocurso\n/subirquiz\n/estado")
