@@ -23,7 +23,6 @@ BOT_ESTUDIANTE_TOKEN = os.getenv("BOT_ESTUDIANTE_TOKEN", "")
 BASE_URL = os.getenv("RAILWAY_PUBLIC_DOMAIN", "")
 
 profe_estado = {}
-estudiante_estado = {}
 
 def get_db():
     db = SessionLocal()
@@ -149,14 +148,14 @@ async def webhook_profe(request: Request, db: Session = Depends(get_db)):
                 f"✅ PDF procesado: <b>{total} estudiantes</b>\n\n{resumen}\n\n"
                 f"📝 Ahora pega la lista de nombres con el formato:\n"
                 f"PAG1: Nombre Apellido\nPAG2: Nombre Apellido\n...")
-            profe_estado[telegram_id] = profe_estado.get(telegram_id, {})
-            profe_estado[telegram_id]["resultados"] = resultados_lista
+            profe_estado[telegram_id] = {"resultados": resultados_lista}
 
         except Exception as e:
             await send_message(BOT_PROFE_TOKEN, chat_id, f"❌ Error procesando PDF: {str(e)}")
 
     elif text and not text.startswith("/"):
         estado_profe = profe_estado.get(telegram_id, {})
+
         if estado_profe.get("esperando") == "nombre_curso" and profe and profe.activo:
             partes = text.rsplit(" ", 1)
             nom = partes[0]
@@ -167,32 +166,15 @@ async def webhook_profe(request: Request, db: Session = Depends(get_db)):
             profe_estado[telegram_id] = {}
             await send_message(BOT_PROFE_TOKEN, chat_id,
                 f"✅ Curso <b>{nom} {grado}</b> creado!\n\nUsa /subirquiz para subir un PDF.")
-        elif estado_profe.get("resultados") and text.upper() == "OK":
-            # Guardar resultados en base de datos como ResultadoTemp
+
+        elif "PAG" in text[:5]:
             resultados = estado_profe.get("resultados", [])
-            for r in resultados:
-                existing = db.query(Resultado).filter(
-                    Resultado.nombre_temp == r["nombre"]
-                ).first()
-                if not existing:
-                    nuevo_r = Resultado(
-                        id=uuid.uuid4(),
-                        nombre_temp=r["nombre"],
-                        nota=r["nota"],
-                        puntos=r["puntos"],
-                        posibles=r["posibles"],
-                        porcentaje=r["porcentaje"],
-                        pagina=r.get("pagina", 0),
-                        confirmado=True
-                    )
-                    db.add(nuevo_r)
-            db.commit()
-            profe_estado[telegram_id] = {}
-            await send_message(BOT_PROFE_TOKEN, chat_id,
-                "✅ Resultados guardados. Los estudiantes ya pueden consultar sus notas escribiendo su nombre.")
-        elif estado_profe.get("resultados") and "PAG" in text[:5]:
+            if not resultados:
+                await send_message(BOT_PROFE_TOKEN, chat_id,
+                    "❌ No encontré el PDF procesado. Por favor vuelve a enviar el PDF primero.")
+                return {"ok": True}
+
             lineas = [l.strip() for l in text.split('\n') if l.strip() and l.strip()[:3] == "PAG"]
-            resultados = estado_profe.get("resultados", [])
             nombres_asignados = 0
             for linea in lineas:
                 try:
@@ -206,10 +188,33 @@ async def webhook_profe(request: Request, db: Session = Depends(get_db)):
                             break
                 except:
                     continue
-            profe_estado[telegram_id]["resultados"] = resultados
+
+            # GUARDAR EN BASE DE DATOS INMEDIATAMENTE
+            guardados = 0
+            for r in resultados:
+                try:
+                    nuevo_r = Resultado(
+                        id=uuid.uuid4(),
+                        nombre_temp=r["nombre"],
+                        nota=r["nota"],
+                        puntos=r["puntos"],
+                        posibles=r["posibles"],
+                        porcentaje=r["porcentaje"],
+                        pagina=r.get("pagina", 0),
+                        confirmado=True
+                    )
+                    db.add(nuevo_r)
+                    guardados += 1
+                except:
+                    pass
+            db.commit()
+            profe_estado[telegram_id] = {}
+
             resumen = "\n".join([f"• <b>{r['nombre']}</b>: {r['nota']}/5.0" for r in resultados])
             await send_message(BOT_PROFE_TOKEN, chat_id,
-                f"✅ <b>{nombres_asignados} nombres asignados!</b>\n\n{resumen}\n\nResponde <b>OK</b> para confirmar y guardar.")
+                f"✅ <b>{nombres_asignados} nombres asignados y {guardados} resultados guardados!</b>\n\n{resumen}\n\n"
+                f"✅ Los estudiantes ya pueden consultar sus notas.")
+
         else:
             await send_message(BOT_PROFE_TOKEN, chat_id,
                 "Comandos:\n/start\n/micursos\n/nuevocurso\n/subirquiz\n/estado")
@@ -259,7 +264,6 @@ async def webhook_estudiante(request: Request, db: Session = Depends(get_db)):
             await send_message(BOT_ESTUDIANTE_TOKEN, chat_id, msg)
 
     elif text and not text.startswith("/"):
-        # Buscar por nombre escrito
         nombre_buscar = text.strip()
         resultados = db.query(Resultado).filter(
             Resultado.nombre_temp.ilike(f"%{nombre_buscar}%"),
@@ -273,7 +277,7 @@ async def webhook_estudiante(request: Request, db: Session = Depends(get_db)):
             for r in resultados:
                 msg += f"📝 Nota: <b>{r.nota}/5.0</b> ({r.porcentaje}%)\n"
             await send_message(BOT_ESTUDIANTE_TOKEN, chat_id, msg)
-    
+
     return {"ok": True}
 
 @app.post("/profes/registrar")
