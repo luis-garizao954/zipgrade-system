@@ -27,7 +27,6 @@ async def procesar_pdf_zipgrade(contenido: bytes) -> list:
         if m:
             porcentaje = float(m.group(1))
         
-        # Mostrar las primeras 5 lineas para diagnostico
         lineas = [l.strip() for l in texto.split('\n') if l.strip()]
         primeras = " | ".join(lineas[:6])
         nombre = f"PAG{i+1}: {primeras[:80]}"
@@ -39,7 +38,8 @@ async def procesar_pdf_zipgrade(contenido: bytes) -> list:
                 "puntos": puntos,
                 "posibles": posibles,
                 "porcentaje": porcentaje or 0,
-                "nota": nota
+                "nota": nota,
+                "pagina": i + 1
             })
     
     return resultados
