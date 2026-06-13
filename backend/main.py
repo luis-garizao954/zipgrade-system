@@ -23,6 +23,7 @@ BOT_ESTUDIANTE_TOKEN = os.getenv("BOT_ESTUDIANTE_TOKEN", "")
 BASE_URL = os.getenv("RAILWAY_PUBLIC_DOMAIN", "")
 
 profe_estado = {}
+estudiante_estado = {}
 
 def get_db():
     db = SessionLocal()
@@ -167,9 +168,28 @@ async def webhook_profe(request: Request, db: Session = Depends(get_db)):
             await send_message(BOT_PROFE_TOKEN, chat_id,
                 f"✅ Curso <b>{nom} {grado}</b> creado!\n\nUsa /subirquiz para subir un PDF.")
         elif estado_profe.get("resultados") and text.upper() == "OK":
-            await send_message(BOT_PROFE_TOKEN, chat_id,
-                "✅ Resultados confirmados. Los estudiantes ya pueden consultar sus notas.")
+            # Guardar resultados en base de datos como ResultadoTemp
+            resultados = estado_profe.get("resultados", [])
+            for r in resultados:
+                existing = db.query(Resultado).filter(
+                    Resultado.nombre_temp == r["nombre"]
+                ).first()
+                if not existing:
+                    nuevo_r = Resultado(
+                        id=uuid.uuid4(),
+                        nombre_temp=r["nombre"],
+                        nota=r["nota"],
+                        puntos=r["puntos"],
+                        posibles=r["posibles"],
+                        porcentaje=r["porcentaje"],
+                        pagina=r.get("pagina", 0),
+                        confirmado=True
+                    )
+                    db.add(nuevo_r)
+            db.commit()
             profe_estado[telegram_id] = {}
+            await send_message(BOT_PROFE_TOKEN, chat_id,
+                "✅ Resultados guardados. Los estudiantes ya pueden consultar sus notas escribiendo su nombre.")
         elif estado_profe.get("resultados") and "PAG" in text[:5]:
             lineas = [l.strip() for l in text.split('\n') if l.strip() and l.strip()[:3] == "PAG"]
             resultados = estado_profe.get("resultados", [])
@@ -212,38 +232,48 @@ async def webhook_estudiante(request: Request, db: Session = Depends(get_db)):
 
     if text == "/start":
         if not estudiante:
-            nuevo = Estudiante(id=uuid.uuid4(), telegram_id=telegram_id, nombre=nombre, apellido="", activo=False)
+            nuevo = Estudiante(id=uuid.uuid4(), telegram_id=telegram_id, nombre=nombre, apellido="", activo=True)
             db.add(nuevo)
             db.commit()
             await send_message(BOT_ESTUDIANTE_TOKEN, chat_id,
-                f"👋 Hola <b>{nombre}</b>!\n\nTu cuenta fue creada. Contacta a tu profe para activar tu suscripcion.")
+                f"👋 Hola <b>{nombre}</b>!\n\nBienvenido al sistema ZipGrade.\n\nEscribe tu nombre completo tal como aparece en tu examen para ver tu nota.")
         else:
-            if estudiante.activo:
-                await send_message(BOT_ESTUDIANTE_TOKEN, chat_id,
-                    f"✅ Hola <b>{estudiante.nombre}</b>!\n\nUsa /misnotas para ver tus resultados.")
-            else:
-                await send_message(BOT_ESTUDIANTE_TOKEN, chat_id,
-                    "❌ Tu suscripcion no esta activa. Contacta a tu profe.")
+            await send_message(BOT_ESTUDIANTE_TOKEN, chat_id,
+                f"✅ Hola <b>{estudiante.nombre}</b>!\n\nEscribe tu nombre completo para buscar tu nota, o usa /misnotas.")
 
     elif text == "/misnotas":
-        if not estudiante or not estudiante.activo:
-            await send_message(BOT_ESTUDIANTE_TOKEN, chat_id, "❌ Necesitas suscripcion activa.")
+        if not estudiante:
+            await send_message(BOT_ESTUDIANTE_TOKEN, chat_id, "Primero escribe /start")
             return {"ok": True}
         resultados = db.query(Resultado).filter(
-            Resultado.estudiante_id == estudiante.id,
-            Resultado.confirmado == True).all()
+            Resultado.nombre_temp.ilike(f"%{estudiante.nombre}%"),
+            Resultado.confirmado == True
+        ).all()
         if not resultados:
-            await send_message(BOT_ESTUDIANTE_TOKEN, chat_id, "📭 Aun no tienes resultados.")
+            await send_message(BOT_ESTUDIANTE_TOKEN, chat_id,
+                f"📭 No encontré resultados para <b>{estudiante.nombre}</b>.\n\nEscribe tu nombre completo como aparece en el examen.")
         else:
-            msg = f"📊 <b>Tus resultados, {estudiante.nombre}:</b>\n\n"
+            msg = f"📊 <b>Resultados para {estudiante.nombre}:</b>\n\n"
             for r in resultados:
-                quiz = db.query(Quiz).filter(Quiz.id == r.quiz_id).first()
-                nom = quiz.nombre if quiz else "Quiz"
-                msg += f"📝 {nom}: <b>{r.nota}/5.0</b>\n"
+                msg += f"📝 Nota: <b>{r.nota}/5.0</b> ({r.porcentaje}%)\n"
             await send_message(BOT_ESTUDIANTE_TOKEN, chat_id, msg)
-    else:
-        await send_message(BOT_ESTUDIANTE_TOKEN, chat_id, "Comandos:\n/start\n/misnotas")
 
+    elif text and not text.startswith("/"):
+        # Buscar por nombre escrito
+        nombre_buscar = text.strip()
+        resultados = db.query(Resultado).filter(
+            Resultado.nombre_temp.ilike(f"%{nombre_buscar}%"),
+            Resultado.confirmado == True
+        ).all()
+        if not resultados:
+            await send_message(BOT_ESTUDIANTE_TOKEN, chat_id,
+                f"❌ No encontré resultados para <b>{nombre_buscar}</b>.\n\nIntenta con tu apellido o como aparece en el examen.")
+        else:
+            msg = f"📊 <b>Resultados para {nombre_buscar}:</b>\n\n"
+            for r in resultados:
+                msg += f"📝 Nota: <b>{r.nota}/5.0</b> ({r.porcentaje}%)\n"
+            await send_message(BOT_ESTUDIANTE_TOKEN, chat_id, msg)
+    
     return {"ok": True}
 
 @app.post("/profes/registrar")
