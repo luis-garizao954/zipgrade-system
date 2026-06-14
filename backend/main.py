@@ -29,6 +29,7 @@ R2_ACCESS_KEY = os.getenv("R2_ACCESS_KEY", "")
 R2_SECRET_KEY = os.getenv("R2_SECRET_KEY", "")
 R2_BUCKET_NAME = os.getenv("R2_BUCKET_NAME", "zipgrade-pdfs")
 R2_PUBLIC_URL = os.getenv("R2_PUBLIC_URL", "")
+PROFE_CHAT_ID = 8911705192
 
 def get_db():
     db = SessionLocal()
@@ -68,14 +69,12 @@ def generar_excel(resultados, titulo):
     center = Alignment(horizontal="center", vertical="center")
     left = Alignment(horizontal="left", vertical="center")
 
-    # Título
     ws.merge_cells("A1:D1")
     ws["A1"] = titulo
     ws["A1"].font = title_font
     ws["A1"].alignment = center
     ws.row_dimensions[1].height = 25
 
-    # Encabezados
     encabezados = ["#", "Estudiante", "Nota (sobre 5.0)", "Porcentaje"]
     anchos = [5, 30, 18, 15]
     for col, (h, ancho) in enumerate(zip(encabezados, anchos), 1):
@@ -86,7 +85,6 @@ def generar_excel(resultados, titulo):
         ws.column_dimensions[cell.column_letter].width = ancho
     ws.row_dimensions[2].height = 20
 
-    # Datos
     for i, r in enumerate(resultados, 1):
         nota = float(r.nota) if r.nota else 0
         porcentaje = float(r.porcentaje) if r.porcentaje else 0
@@ -110,7 +108,6 @@ def generar_excel(resultados, titulo):
 
         ws.row_dimensions[fila].height = 18
 
-    # Promedio
     total = len(resultados)
     if total > 0:
         promedio = sum(float(r.nota) for r in resultados if r.nota) / total
@@ -326,6 +323,22 @@ async def webhook_profe(request: Request, db: Session = Depends(get_db)):
             await send_message(BOT_PROFE_TOKEN, chat_id,
                 f"📊 ¿De qué materia quieres el Excel?\n\nMaterias disponibles:\n{lista}\n\nEscribe el nombre de la materia:")
 
+    elif text and text.startswith("/responder"):
+        partes = text.split(" ", 2)
+        if len(partes) >= 3:
+            try:
+                estudiante_chat_id = int(partes[1])
+                respuesta = partes[2]
+                await send_message(BOT_ESTUDIANTE_TOKEN, estudiante_chat_id,
+                    f"📬 <b>Respuesta de tu profe:</b>\n\n{respuesta}")
+                await send_message(BOT_PROFE_TOKEN, chat_id, "✅ Respuesta enviada al estudiante.")
+            except Exception as e:
+                await send_message(BOT_PROFE_TOKEN, chat_id,
+                    f"❌ Error al enviar: {str(e)}\nFormato: <code>/responder ID_ESTUDIANTE tu respuesta</code>")
+        else:
+            await send_message(BOT_PROFE_TOKEN, chat_id,
+                "❌ Formato incorrecto.\nUsa: <code>/responder ID_ESTUDIANTE tu respuesta aqui</code>")
+
     elif document:
         file_name = document.get("file_name", "")
         file_id = document.get("file_id")
@@ -512,74 +525,95 @@ async def webhook_estudiante(request: Request, db: Session = Depends(get_db)):
             await send_message(BOT_ESTUDIANTE_TOKEN, chat_id,
                 f"👋 Hola <b>{nombre}</b>!\n\nBienvenido al sistema ZipGrade.\n\n"
                 f"Puedes:\n• Escribir tu <b>nombre</b> para ver todas tus notas\n"
-                f"• Escribir una <b>materia</b> (ej: matematicas) para ver notas de esa materia")
+                f"• Escribir una <b>materia</b> (ej: matematicas) para ver notas de esa materia\n"
+                f"• Usar /duda para enviarle un mensaje a tu profe")
         else:
             await send_message(BOT_ESTUDIANTE_TOKEN, chat_id,
-                f"✅ Hola <b>{estudiante.nombre}</b>!\n\nEscribe tu nombre o una materia para ver tus notas.")
+                f"✅ Hola <b>{estudiante.nombre}</b>!\n\n"
+                f"Escribe tu nombre, una materia, o usa /duda para contactar a tu profe.")
+
+    elif text == "/duda":
+        set_estado(db, telegram_id, "esperando_duda", "si")
+        await send_message(BOT_ESTUDIANTE_TOKEN, chat_id,
+            "✏️ Escribe tu duda o pregunta y se la enviaré a tu profe:")
 
     elif text and not text.startswith("/"):
-        busqueda = text.strip()
+        esperando = get_estado(db, telegram_id, "esperando_duda")
 
-        resultados_materia = db.query(Resultado).filter(
-            Resultado.curso_nombre.ilike(f"%{busqueda}%"),
-            Resultado.confirmado == True
-        ).all()
+        if esperando == "si":
+            del_estado(db, telegram_id, "esperando_duda")
+            nombre_est = estudiante.nombre if estudiante else nombre
+            await send_message(BOT_PROFE_TOKEN, PROFE_CHAT_ID,
+                f"📩 <b>Mensaje de estudiante:</b>\n\n"
+                f"👤 <b>{nombre_est}</b> (ID: <code>{telegram_id}</code>)\n\n"
+                f"💬 {text}\n\n"
+                f"Para responder escribe:\n<code>/responder {telegram_id} tu respuesta aqui</code>")
+            await send_message(BOT_ESTUDIANTE_TOKEN, chat_id,
+                "✅ Tu mensaje fue enviado a tu profe. Te responderá pronto.")
+        else:
+            busqueda = text.strip()
 
-        resultados_nombre = db.query(Resultado).filter(
-            Resultado.nombre_temp.ilike(f"%{busqueda}%"),
-            Resultado.confirmado == True
-        ).all()
+            resultados_materia = db.query(Resultado).filter(
+                Resultado.curso_nombre.ilike(f"%{busqueda}%"),
+                Resultado.confirmado == True
+            ).all()
 
-        if resultados_materia and not resultados_nombre:
-            est = db.query(Estudiante).filter(Estudiante.telegram_id == telegram_id).first()
-            if est and est.nombre:
-                resultados = db.query(Resultado).filter(
-                    Resultado.curso_nombre.ilike(f"%{busqueda}%"),
-                    Resultado.nombre_temp.ilike(f"%{est.nombre}%"),
-                    Resultado.confirmado == True
-                ).all()
-                if not resultados:
-                    await send_message(BOT_ESTUDIANTE_TOKEN, chat_id,
-                        f"❌ No encontré tus notas en <b>{busqueda}</b>.\n\nPrimero escribe tu nombre completo.")
+            resultados_nombre = db.query(Resultado).filter(
+                Resultado.nombre_temp.ilike(f"%{busqueda}%"),
+                Resultado.confirmado == True
+            ).all()
+
+            if resultados_materia and not resultados_nombre:
+                est = db.query(Estudiante).filter(Estudiante.telegram_id == telegram_id).first()
+                if est and est.nombre:
+                    resultados = db.query(Resultado).filter(
+                        Resultado.curso_nombre.ilike(f"%{busqueda}%"),
+                        Resultado.nombre_temp.ilike(f"%{est.nombre}%"),
+                        Resultado.confirmado == True
+                    ).all()
+                    if not resultados:
+                        await send_message(BOT_ESTUDIANTE_TOKEN, chat_id,
+                            f"❌ No encontré tus notas en <b>{busqueda}</b>.\n\nPrimero escribe tu nombre completo.")
+                    else:
+                        msg = f"📚 <b>Tus notas en {busqueda.title()}:</b>\n\n"
+                        for r in resultados:
+                            msg += f"📝 <b>{r.quiz_nombre}</b>: {r.nota}/5.0 ({r.porcentaje}%)\n"
+                        await send_message(BOT_ESTUDIANTE_TOKEN, chat_id, msg)
+                        for r in resultados:
+                            if r.imagen_url:
+                                await send_photo(BOT_ESTUDIANTE_TOKEN, chat_id, r.imagen_url,
+                                    f"📋 {r.quiz_nombre} - Tu hoja de respuestas")
+                            if r.quiz_pdf_url:
+                                await send_document_url(BOT_ESTUDIANTE_TOKEN, chat_id, r.quiz_pdf_url,
+                                    f"📄 {r.quiz_nombre} - PDF del quiz")
                 else:
-                    msg = f"📚 <b>Tus notas en {busqueda.title()}:</b>\n\n"
-                    for r in resultados:
-                        msg += f"📝 <b>{r.quiz_nombre}</b>: {r.nota}/5.0 ({r.porcentaje}%)\n"
-                    await send_message(BOT_ESTUDIANTE_TOKEN, chat_id, msg)
-                    for r in resultados:
-                        if r.imagen_url:
-                            await send_photo(BOT_ESTUDIANTE_TOKEN, chat_id, r.imagen_url,
-                                f"📋 {r.quiz_nombre} - Tu hoja de respuestas")
-                        if r.quiz_pdf_url:
-                            await send_document_url(BOT_ESTUDIANTE_TOKEN, chat_id, r.quiz_pdf_url,
-                                f"📄 {r.quiz_nombre} - PDF del quiz")
+                    await send_message(BOT_ESTUDIANTE_TOKEN, chat_id,
+                        f"❌ Primero escribe tu nombre completo para registrarte.")
+
+            elif resultados_nombre:
+                est = db.query(Estudiante).filter(Estudiante.telegram_id == telegram_id).first()
+                if est and est.nombre != busqueda:
+                    est.nombre = busqueda
+                    db.commit()
+
+                msg = f"📊 <b>Todas tus notas ({busqueda}):</b>\n\n"
+                for r in resultados_nombre:
+                    curso = r.curso_nombre or "Sin curso"
+                    quiz = r.quiz_nombre or "Sin quiz"
+                    msg += f"📚 <b>{curso}</b> - {quiz}: <b>{r.nota}/5.0</b> ({r.porcentaje}%)\n"
+                await send_message(BOT_ESTUDIANTE_TOKEN, chat_id, msg)
+                for r in resultados_nombre:
+                    if r.imagen_url:
+                        await send_photo(BOT_ESTUDIANTE_TOKEN, chat_id, r.imagen_url,
+                            f"📋 {r.curso_nombre} - {r.quiz_nombre}")
+                    if r.quiz_pdf_url:
+                        await send_document_url(BOT_ESTUDIANTE_TOKEN, chat_id, r.quiz_pdf_url,
+                            f"📄 {r.curso_nombre} - {r.quiz_nombre}")
             else:
                 await send_message(BOT_ESTUDIANTE_TOKEN, chat_id,
-                    f"❌ Primero escribe tu nombre completo para registrarte.")
-
-        elif resultados_nombre:
-            est = db.query(Estudiante).filter(Estudiante.telegram_id == telegram_id).first()
-            if est and est.nombre != busqueda:
-                est.nombre = busqueda
-                db.commit()
-
-            msg = f"📊 <b>Todas tus notas ({busqueda}):</b>\n\n"
-            for r in resultados_nombre:
-                curso = r.curso_nombre or "Sin curso"
-                quiz = r.quiz_nombre or "Sin quiz"
-                msg += f"📚 <b>{curso}</b> - {quiz}: <b>{r.nota}/5.0</b> ({r.porcentaje}%)\n"
-            await send_message(BOT_ESTUDIANTE_TOKEN, chat_id, msg)
-            for r in resultados_nombre:
-                if r.imagen_url:
-                    await send_photo(BOT_ESTUDIANTE_TOKEN, chat_id, r.imagen_url,
-                        f"📋 {r.curso_nombre} - {r.quiz_nombre}")
-                if r.quiz_pdf_url:
-                    await send_document_url(BOT_ESTUDIANTE_TOKEN, chat_id, r.quiz_pdf_url,
-                        f"📄 {r.curso_nombre} - {r.quiz_nombre}")
-        else:
-            await send_message(BOT_ESTUDIANTE_TOKEN, chat_id,
-                f"❌ No encontré resultados para <b>{busqueda}</b>.\n\n"
-                f"Intenta con tu nombre completo o el nombre de la materia.")
+                    f"❌ No encontré resultados para <b>{busqueda}</b>.\n\n"
+                    f"Intenta con tu nombre completo o el nombre de la materia.\n"
+                    f"¿Tienes una duda? Usa /duda para contactar a tu profe.")
 
     return {"ok": True}
 
