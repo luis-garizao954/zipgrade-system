@@ -1,274 +1,314 @@
-"""
-Bot del Profe - ZipGrade System
-Comandos:
-  /start       - Registrarse
-  /micursos    - Ver y crear cursos
-  /subirquiz   - Subir PDF de ZipGrade
-  /estudiantes - Gestionar estudiantes del curso
-  /estado      - Ver estado de suscripción
-"""
-import logging
-import io
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    ApplicationBuilder, CommandHandler, MessageHandler,
-    CallbackQueryHandler, ConversationHandler, ContextTypes, filters
+from fastapi import FastAPI, UploadFile, File, Form, Depends, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy import create_engine
+from sqlalchemy.orm import Session, sessionmaker
+from backend.config import settings
+from backend.models.models import Base, Profe, Estudiante, Curso, Quiz, Resultado, CursoEstudiante
+from backend.services.suscripcion_service import (
+    profe_activo, estudiante_activo, activar_profe, activar_estudiante,
+    desactivar_profe, desactivar_estudiante
 )
-import httpx
+from backend.services.pdf_service import procesar_pdf_zipgrade
+import uuid, os, httpx, io
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+app = FastAPI(title="ZipGrade System API", version="1.0.0")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-API_URL = "http://localhost:8000"
+engine = create_engine(settings.DATABASE_URL)
+Base.metadata.create_all(bind=engine)
+SessionLocal = sessionmaker(bind=engine)
 
-# Estados del ConversationHandler
-ESPERANDO_NOMBRE_CURSO, ESPERANDO_GRADO, ESPERANDO_PDF, REVISANDO_NOMBRES, ESPERANDO_NOMBRE_QUIZ = range(5)
+BOT_PROFE_TOKEN = os.getenv("BOT_PROFE_TOKEN", "")
+BOT_ESTUDIANTE_TOKEN = os.getenv("BOT_ESTUDIANTE_TOKEN", "")
+BASE_URL = os.getenv("RAILWAY_PUBLIC_DOMAIN", "")
 
-# ─── HELPERS ──────────────────────────────────────────────────────────────────
+profe_estado = {}
 
-async def api_get(endpoint: str, params: dict = None):
-    async with httpx.AsyncClient() as c:
-        r = await c.get(f"{API_URL}{endpoint}", params=params, timeout=30)
-        return r.json() if r.status_code == 200 else None
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
 
-async def api_post(endpoint: str, data: dict = None, files=None):
-    async with httpx.AsyncClient() as c:
-        if files:
-            r = await c.post(f"{API_URL}{endpoint}", data=data, files=files, timeout=120)
+async def send_message(token, chat_id, text, reply_markup=None):
+    payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+    async with httpx.AsyncClient() as client:
+        await client.post(f"https://api.telegram.org/bot{token}/sendMessage", json=payload)
+
+@app.on_event("startup")
+async def set_webhooks():
+    if BOT_PROFE_TOKEN and BASE_URL:
+        async with httpx.AsyncClient() as client:
+            await client.get(f"https://api.telegram.org/bot{BOT_PROFE_TOKEN}/setWebhook",
+                params={"url": f"https://{BASE_URL}/webhook/profe"})
+            await client.get(f"https://api.telegram.org/bot{BOT_ESTUDIANTE_TOKEN}/setWebhook",
+                params={"url": f"https://{BASE_URL}/webhook/estudiante"})
+
+@app.post("/webhook/profe")
+async def webhook_profe(request: Request, db: Session = Depends(get_db)):
+    data = await request.json()
+    callback = data.get("callback_query", {})
+    message = data.get("message", {})
+
+    if callback:
+        chat_id = callback.get("from", {}).get("id")
+        telegram_id = chat_id
+        cb_data = callback.get("data", "")
+        if cb_data.startswith("curso_"):
+            curso_id = cb_data.replace("curso_", "")
+            curso = db.query(Curso).filter(Curso.id == curso_id).first()
+            if curso:
+                profe_estado[telegram_id] = {"curso_id": curso_id, "curso_nombre": curso.nombre}
+                await send_message(BOT_PROFE_TOKEN, chat_id,
+                    f"📚 Curso: <b>{curso.nombre} - {curso.grado}</b>\n\nAhora envíame el PDF de ZipGrade.")
+        return {"ok": True}
+
+    chat_id = message.get("chat", {}).get("id")
+    text = message.get("text", "")
+    telegram_id = message.get("from", {}).get("id")
+    nombre = message.get("from", {}).get("first_name", "Profe")
+    document = message.get("document", {})
+
+    if not chat_id:
+        return {"ok": True}
+
+    profe = db.query(Profe).filter(Profe.telegram_id == telegram_id).first()
+
+    if text == "/start":
+        if not profe:
+            nuevo = Profe(id=uuid.uuid4(), telegram_id=telegram_id, nombre=nombre, email="", activo=False)
+            db.add(nuevo)
+            db.commit()
+            await send_message(BOT_PROFE_TOKEN, chat_id,
+                f"👋 Hola <b>{nombre}</b>!\n\nTu cuenta fue creada. Contacta al administrador para activar tu suscripcion.")
         else:
-            r = await c.post(f"{API_URL}{endpoint}", json=data, timeout=30)
-        return r.json() if r.status_code in [200, 201] else None
+            if profe.activo:
+                await send_message(BOT_PROFE_TOKEN, chat_id,
+                    f"✅ Hola <b>{profe.nombre}</b>! Tu suscripcion esta activa.\n\n📋 Comandos:\n/micursos - Ver tus cursos\n/nuevocurso - Crear un curso\n/subirquiz - Subir PDF de ZipGrade\n/estado - Ver tu suscripcion")
+            else:
+                await send_message(BOT_PROFE_TOKEN, chat_id,
+                    "❌ Tu suscripcion no esta activa. Contacta al administrador.")
 
-# ─── /start ───────────────────────────────────────────────────────────────────
+    elif text == "/estado":
+        if profe:
+            estado = "✅ Activa" if profe.activo else "❌ Inactiva"
+            await send_message(BOT_PROFE_TOKEN, chat_id, f"📊 Tu suscripcion: {estado}")
 
-async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    tid = update.effective_user.id
-    nombre = update.effective_user.full_name
-    profe = await api_post("/profes/registrar", {"telegram_id": tid, "nombre": nombre})
+    elif text == "/micursos":
+        if not profe or not profe.activo:
+            await send_message(BOT_PROFE_TOKEN, chat_id, "❌ Necesitas suscripcion activa.")
+            return {"ok": True}
+        cursos = db.query(Curso).filter(Curso.profe_id == profe.id).all()
+        if not cursos:
+            await send_message(BOT_PROFE_TOKEN, chat_id,
+                "No tienes cursos aun. Usa /nuevocurso para crear uno.")
+        else:
+            lista = "\n".join([f"📚 {c.nombre} - {c.grado}" for c in cursos])
+            await send_message(BOT_PROFE_TOKEN, chat_id, f"Tus cursos:\n\n{lista}")
+
+    elif text == "/nuevocurso":
+        if not profe or not profe.activo:
+            await send_message(BOT_PROFE_TOKEN, chat_id, "❌ Necesitas suscripcion activa.")
+            return {"ok": True}
+        profe_estado[telegram_id] = {"esperando": "nombre_curso"}
+        await send_message(BOT_PROFE_TOKEN, chat_id,
+            "✏️ Escribe el nombre y grado del curso en este formato:\n\n<b>Matematicas 9B</b>")
+
+    elif text == "/subirquiz":
+        if not profe or not profe.activo:
+            await send_message(BOT_PROFE_TOKEN, chat_id, "❌ Necesitas suscripcion activa.")
+            return {"ok": True}
+        cursos = db.query(Curso).filter(Curso.profe_id == profe.id).all()
+        if not cursos:
+            await send_message(BOT_PROFE_TOKEN, chat_id, "Primero crea un curso con /nuevocurso")
+        else:
+            botones = {"inline_keyboard": [[{"text": f"📚 {c.nombre} - {c.grado}", "callback_data": f"curso_{c.id}"}] for c in cursos]}
+            await send_message(BOT_PROFE_TOKEN, chat_id, "¿A qué curso pertenece este quiz?", reply_markup=botones)
+
+    elif document and document.get("file_name", "").endswith(".pdf"):
+        await send_message(BOT_PROFE_TOKEN, chat_id,
+            "📎 PDF recibido. Procesando...\n\n⏳ Esto puede tardar unos segundos.")
+        try:
+            file_id = document.get("file_id")
+            async with httpx.AsyncClient(timeout=60) as client:
+                r = await client.get(f"https://api.telegram.org/bot{BOT_PROFE_TOKEN}/getFile",
+                    params={"file_id": file_id})
+                file_path = r.json()["result"]["file_path"]
+                pdf_r = await client.get(f"https://api.telegram.org/file/bot{BOT_PROFE_TOKEN}/{file_path}")
+                pdf_bytes = pdf_r.content
+
+            resultados_lista = await procesar_pdf_zipgrade(pdf_bytes)
+            total = len(resultados_lista)
+
+            resumen = "\n".join([f"• <b>{r['nombre']}</b>: {r['nota']}/5.0 ({r['porcentaje']}%)" for r in resultados_lista])
+            await send_message(BOT_PROFE_TOKEN, chat_id,
+                f"✅ PDF procesado: <b>{total} estudiantes</b>\n\n{resumen}\n\nResponde <b>OK</b> para confirmar y guardar.")
+            profe_estado[telegram_id] = profe_estado.get(telegram_id, {})
+            profe_estado[telegram_id]["resultados"] = resultados_lista
+
+        except Exception as e:
+            await send_message(BOT_PROFE_TOKEN, chat_id, f"❌ Error procesando PDF: {str(e)}")
+
+    elif text and not text.startswith("/"):
+        estado_profe = profe_estado.get(telegram_id, {})
+        if estado_profe.get("esperando") == "nombre_curso" and profe and profe.activo:
+            partes = text.rsplit(" ", 1)
+            nom = partes[0]
+            grado = partes[1] if len(partes) > 1 else ""
+            nuevo_curso = Curso(id=uuid.uuid4(), profe_id=profe.id, nombre=nom, grado=grado)
+            db.add(nuevo_curso)
+            db.commit()
+            profe_estado[telegram_id] = {}
+            await send_message(BOT_PROFE_TOKEN, chat_id,
+                f"✅ Curso <b>{nom} {grado}</b> creado!\n\nUsa /subirquiz para subir un PDF.")
+        elif text.upper() == "OK" and estado_profe.get("resultados"):
+            await send_message(BOT_PROFE_TOKEN, chat_id,
+                "✅ Resultados confirmados. Los estudiantes ya pueden consultar sus notas.")
+            profe_estado[telegram_id] = {}
+        else:
+            await send_message(BOT_PROFE_TOKEN, chat_id,
+                "Comandos:\n/start\n/micursos\n/nuevocurso\n/subirquiz\n/estado")
+
+    return {"ok": True}
+
+@app.post("/webhook/estudiante")
+async def webhook_estudiante(request: Request, db: Session = Depends(get_db)):
+    data = await request.json()
+    message = data.get("message", {})
+    chat_id = message.get("chat", {}).get("id")
+    text = message.get("text", "")
+    telegram_id = message.get("from", {}).get("id")
+    nombre = message.get("from", {}).get("first_name", "Estudiante")
+
+    if not chat_id:
+        return {"ok": True}
+
+    estudiante = db.query(Estudiante).filter(Estudiante.telegram_id == telegram_id).first()
+
+    if text == "/start":
+        if not estudiante:
+            nuevo = Estudiante(id=uuid.uuid4(), telegram_id=telegram_id, nombre=nombre, apellido="", activo=False)
+            db.add(nuevo)
+            db.commit()
+            await send_message(BOT_ESTUDIANTE_TOKEN, chat_id,
+                f"👋 Hola <b>{nombre}</b>!\n\nTu cuenta fue creada. Contacta a tu profe para activar tu suscripcion.")
+        else:
+            if estudiante.activo:
+                await send_message(BOT_ESTUDIANTE_TOKEN, chat_id,
+                    f"✅ Hola <b>{estudiante.nombre}</b>!\n\nUsa /misnotas para ver tus resultados.")
+            else:
+                await send_message(BOT_ESTUDIANTE_TOKEN, chat_id,
+                    "❌ Tu suscripcion no esta activa. Contacta a tu profe.")
+
+    elif text == "/misnotas":
+        if not estudiante or not estudiante.activo:
+            await send_message(BOT_ESTUDIANTE_TOKEN, chat_id, "❌ Necesitas suscripcion activa.")
+            return {"ok": True}
+        resultados = db.query(Resultado).filter(
+            Resultado.estudiante_id == estudiante.id,
+            Resultado.confirmado == True).all()
+        if not resultados:
+            await send_message(BOT_ESTUDIANTE_TOKEN, chat_id, "📭 Aun no tienes resultados.")
+        else:
+            msg = f"📊 <b>Tus resultados, {estudiante.nombre}:</b>\n\n"
+            for r in resultados:
+                quiz = db.query(Quiz).filter(Quiz.id == r.quiz_id).first()
+                nom = quiz.nombre if quiz else "Quiz"
+                msg += f"📝 {nom}: <b>{r.nota}/5.0</b>\n"
+            await send_message(BOT_ESTUDIANTE_TOKEN, chat_id, msg)
+    else:
+        await send_message(BOT_ESTUDIANTE_TOKEN, chat_id, "Comandos:\n/start\n/misnotas")
+
+    return {"ok": True}
+
+@app.post("/profes/registrar")
+def registrar_profe(data: dict, db: Session = Depends(get_db)):
+    profe = db.query(Profe).filter(Profe.telegram_id == data["telegram_id"]).first()
     if profe:
-        await update.message.reply_text(
-            f"👋 Hola, *{nombre}*\\!\n\n"
-            f"Estás registrado como profe en el sistema ZipGrade\\.\n\n"
-            f"📋 *Comandos disponibles:*\n"
-            f"/micursos \\- Ver y crear cursos\n"
-            f"/subirquiz \\- Subir PDF de ZipGrade\n"
-            f"/estado \\- Ver tu suscripción\n\n"
-            f"⚠️ Necesitas una suscripción activa para subir quizzes\\.",
-            parse_mode="MarkdownV2"
-        )
-    else:
-        await update.message.reply_text("❌ Error registrándote. Intenta de nuevo.")
+        return {"id": str(profe.id), "nombre": profe.nombre, "activo": profe.activo}
+    nuevo = Profe(id=uuid.uuid4(), telegram_id=data["telegram_id"], nombre=data.get("nombre", ""), email="", activo=False)
+    db.add(nuevo)
+    db.commit()
+    return {"id": str(nuevo.id), "nombre": nuevo.nombre, "activo": nuevo.activo}
 
-# ─── /estado ──────────────────────────────────────────────────────────────────
-
-async def estado(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    tid = update.effective_user.id
-    profe = await api_get(f"/profes/by-telegram/{tid}")
+@app.get("/profes/by-telegram/{telegram_id}")
+def get_profe_by_telegram(telegram_id: int, db: Session = Depends(get_db)):
+    profe = db.query(Profe).filter(Profe.telegram_id == telegram_id).first()
     if not profe:
-        await update.message.reply_text("No estás registrado. Usa /start")
-        return
-    estado_txt = "✅ Activa" if profe["activo"] else "❌ Inactiva"
-    vence = profe.get("suscripcion_hasta", "—")
-    await update.message.reply_text(
-        f"📊 *Tu suscripción*\n\n"
-        f"Estado: {estado_txt}\n"
-        f"Vence: {vence[:10] if vence else '—'}\n\n"
-        f"Para renovar contacta al administrador\\.",
-        parse_mode="MarkdownV2"
-    )
+        raise HTTPException(status_code=404, detail="Profe no encontrado")
+    return {"id": str(profe.id), "nombre": profe.nombre, "activo": profe.activo}
 
-# ─── /micursos ────────────────────────────────────────────────────────────────
+@app.get("/profes/activo/{telegram_id}")
+def check_profe_activo(telegram_id: int, db: Session = Depends(get_db)):
+    return {"activo": profe_activo(telegram_id, db)}
 
-async def mis_cursos(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    tid = update.effective_user.id
-    cursos = await api_get(f"/cursos/by-profe-telegram/{tid}")
-    if not cursos:
-        keyboard = [[InlineKeyboardButton("➕ Crear primer curso", callback_data="crear_curso")]]
-        await update.message.reply_text(
-            "No tienes cursos aún.",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-        return
-    keyboard = [[InlineKeyboardButton(f"📚 {c['nombre']} - {c['grado']}", callback_data=f"curso_{c['id']}")] for c in cursos]
-    keyboard.append([InlineKeyboardButton("➕ Nuevo curso", callback_data="crear_curso")])
-    await update.message.reply_text(
-        "📚 *Tus cursos:*",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode="MarkdownV2"
-    )
+@app.post("/estudiantes/registrar")
+def registrar_estudiante(data: dict, db: Session = Depends(get_db)):
+    est = db.query(Estudiante).filter(Estudiante.telegram_id == data["telegram_id"]).first()
+    if est:
+        return {"id": str(est.id), "nombre": est.nombre, "activo": est.activo}
+    nuevo = Estudiante(id=uuid.uuid4(), telegram_id=data["telegram_id"], nombre=data.get("nombre", ""), apellido="", activo=False)
+    db.add(nuevo)
+    db.commit()
+    return {"id": str(nuevo.id), "nombre": nuevo.nombre, "activo": nuevo.activo}
 
-async def callback_curso(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    if query.data == "crear_curso":
-        await query.message.reply_text("✏️ ¿Cómo se llama el nuevo curso? (ej: Matemáticas)")
-        return ESPERANDO_NOMBRE_CURSO
+@app.get("/estudiantes/by-telegram/{telegram_id}")
+def get_estudiante_by_telegram(telegram_id: int, db: Session = Depends(get_db)):
+    est = db.query(Estudiante).filter(Estudiante.telegram_id == telegram_id).first()
+    if not est:
+        raise HTTPException(status_code=404, detail="Estudiante no encontrado")
+    return {"id": str(est.id), "nombre": est.nombre, "apellido": est.apellido, "activo": est.activo}
 
-async def recibir_nombre_curso(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    ctx.user_data["nombre_curso"] = update.message.text
-    await update.message.reply_text("¿Cuál es el grado? (ej: 9°B)")
-    return ESPERANDO_GRADO
+@app.get("/estudiantes/activo/{telegram_id}")
+def check_estudiante_activo(telegram_id: int, db: Session = Depends(get_db)):
+    return {"activo": estudiante_activo(telegram_id, db)}
 
-async def recibir_grado(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    tid = update.effective_user.id
-    nombre = ctx.user_data.get("nombre_curso")
-    grado = update.message.text
-    profe = await api_get(f"/profes/by-telegram/{tid}")
+@app.post("/cursos/crear")
+def crear_curso(data: dict, db: Session = Depends(get_db)):
+    nuevo = Curso(id=uuid.uuid4(), profe_id=data["profe_id"], nombre=data["nombre"], grado=data.get("grado", ""))
+    db.add(nuevo)
+    db.commit()
+    return {"id": str(nuevo.id), "nombre": nuevo.nombre, "grado": nuevo.grado}
+
+@app.get("/cursos/by-profe-telegram/{telegram_id}")
+def cursos_by_profe(telegram_id: int, db: Session = Depends(get_db)):
+    profe = db.query(Profe).filter(Profe.telegram_id == telegram_id).first()
     if not profe:
-        await update.message.reply_text("Error. Usa /start primero.")
-        return ConversationHandler.END
-    curso = await api_post("/cursos/crear", {
-        "profe_id": profe["id"],
-        "nombre": nombre,
-        "grado": grado
-    })
-    if curso:
-        await update.message.reply_text(f"✅ Curso *{nombre}* \\- {grado} creado\\!", parse_mode="MarkdownV2")
-    else:
-        await update.message.reply_text("❌ Error creando el curso.")
-    return ConversationHandler.END
+        return []
+    cursos = db.query(Curso).filter(Curso.profe_id == profe.id).all()
+    return [{"id": str(c.id), "nombre": c.nombre, "grado": c.grado} for c in cursos]
 
-# ─── /subirquiz ───────────────────────────────────────────────────────────────
+@app.post("/quizzes/procesar-pdf")
+async def procesar_pdf_endpoint(archivo: UploadFile = File(...), curso_id: str = Form(...), db: Session = Depends(get_db)):
+    contenido = await archivo.read()
+    resultados = await procesar_pdf_zipgrade(contenido)
+    return {"resultados": resultados, "total": len(resultados)}
 
-async def subir_quiz(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    tid = update.effective_user.id
-    activo = await api_get(f"/profes/activo/{tid}")
-    if not activo or not activo.get("activo"):
-        await update.message.reply_text(
-            "⚠️ Tu suscripción no está activa.\n"
-            "Contacta al administrador para renovarla."
-        )
-        return ConversationHandler.END
-    cursos = await api_get(f"/cursos/by-profe-telegram/{tid}")
-    if not cursos:
-        await update.message.reply_text("Primero crea un curso con /micursos")
-        return ConversationHandler.END
-    keyboard = [[InlineKeyboardButton(f"📚 {c['nombre']} - {c['grado']}", callback_data=f"selcurso_{c['id']}")] for c in cursos]
-    await update.message.reply_text(
-        "¿A qué curso pertenece este quiz?",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
-    return ESPERANDO_NOMBRE_QUIZ
+@app.get("/resultados/historial/{estudiante_id}")
+def historial_estudiante(estudiante_id: str, db: Session = Depends(get_db)):
+    return db.query(Resultado).filter(
+        Resultado.estudiante_id == estudiante_id,
+        Resultado.confirmado == True).all()
 
-async def seleccionar_curso_quiz(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    curso_id = query.data.replace("selcurso_", "")
-    ctx.user_data["curso_id"] = curso_id
-    await query.message.reply_text("¿Cómo se llama este quiz? (ej: Quiz 1 - Fracciones)")
-    return ESPERANDO_PDF
+@app.post("/admin/activar-profe/{telegram_id}")
+def admin_activar_profe(telegram_id: int, db: Session = Depends(get_db)):
+    activar_profe(telegram_id, db)
+    return {"ok": True}
 
-async def recibir_nombre_quiz(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    ctx.user_data["nombre_quiz"] = update.message.text
-    await update.message.reply_text(
-        "📎 Ahora envía el *PDF de ZipGrade* con todos los resultados\\.",
-        parse_mode="MarkdownV2"
-    )
-    return REVISANDO_NOMBRES
+@app.post("/admin/desactivar-profe/{telegram_id}")
+def admin_desactivar_profe(telegram_id: int, db: Session = Depends(get_db)):
+    desactivar_profe(telegram_id, db)
+    return {"ok": True}
 
-async def recibir_pdf(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not update.message.document or not update.message.document.file_name.endswith(".pdf"):
-        await update.message.reply_text("Por favor envía un archivo PDF.")
-        return REVISANDO_NOMBRES
+@app.post("/admin/activar-estudiante/{telegram_id}")
+def admin_activar_estudiante(telegram_id: int, db: Session = Depends(get_db)):
+    activar_estudiante(telegram_id, db)
+    return {"ok": True}
 
-    await update.message.reply_text("⏳ Procesando PDF y leyendo apellidos con IA...")
-
-    file = await update.message.document.get_file()
-    pdf_bytes = await file.download_as_bytearray()
-    tid = update.effective_user.id
-    profe = await api_get(f"/profes/by-telegram/{tid}")
-
-    # Enviar al backend para procesar
-    async with httpx.AsyncClient(timeout=180) as c:
-        r = await c.post(
-            f"{API_URL}/quizzes/procesar-pdf",
-            data={
-                "profe_id": profe["id"],
-                "curso_id": ctx.user_data["curso_id"],
-                "nombre_quiz": ctx.user_data["nombre_quiz"]
-            },
-            files={"pdf": ("quiz.pdf", bytes(pdf_bytes), "application/pdf")}
-        )
-        if r.status_code != 200:
-            await update.message.reply_text("❌ Error procesando el PDF.")
-            return ConversationHandler.END
-        resultado = r.json()
-
-    ctx.user_data["procesamiento_id"] = resultado["procesamiento_id"]
-    paginas = resultado["paginas"]
-    ctx.user_data["paginas"] = paginas
-    ctx.user_data["pagina_actual"] = 0
-
-    await update.message.reply_text(
-        f"✅ PDF procesado: *{len(paginas)} páginas* encontradas\\.\n\n"
-        f"Ahora revisarás cada resultado para confirmar o corregir el apellido\\.",
-        parse_mode="MarkdownV2"
-    )
-    await mostrar_pagina_revision(update, ctx)
-    return ConversationHandler.END
-
-async def mostrar_pagina_revision(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    paginas = ctx.user_data.get("paginas", [])
-    i = ctx.user_data.get("pagina_actual", 0)
-    if i >= len(paginas):
-        await update.message.reply_text(
-            "🎉 *¡Revisión completa\\!* Todos los resultados fueron guardados\\.\n"
-            "Los estudiantes ya pueden consultar sus notas\\.",
-            parse_mode="MarkdownV2"
-        )
-        return
-    p = paginas[i]
-    confianza_emoji = "✅" if p["confianza"] == "alta" else "⚠️" if p["confianza"] == "media" else "❌"
-    keyboard = [
-        [InlineKeyboardButton("✅ Confirmar", callback_data=f"confirmar_{i}"),
-         InlineKeyboardButton("✏️ Corregir", callback_data=f"corregir_{i}")],
-        [InlineKeyboardButton("⏭️ Omitir", callback_data=f"omitir_{i}")]
-    ]
-    await update.message.reply_text(
-        f"📄 Página {i+1}/{len(paginas)}\n\n"
-        f"Apellido detectado: *{p['apellido_detectado'] or 'No detectado'}*\n"
-        f"Confianza IA: {confianza_emoji} {p['confianza']}\n\n"
-        f"¿Es correcto?",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode="MarkdownV2"
-    )
-
-# ─── MAIN ─────────────────────────────────────────────────────────────────────
-
-def main():
-    from backend.config import settings
-    app = ApplicationBuilder().token(settings.BOT_PROFE_TOKEN).build()
-
-    conv_curso = ConversationHandler(
-        entry_points=[CallbackQueryHandler(callback_curso, pattern="^crear_curso$")],
-        states={
-            ESPERANDO_NOMBRE_CURSO: [MessageHandler(filters.TEXT & ~filters.COMMAND, recibir_nombre_curso)],
-            ESPERANDO_GRADO: [MessageHandler(filters.TEXT & ~filters.COMMAND, recibir_grado)],
-        },
-        fallbacks=[]
-    )
-
-    conv_quiz = ConversationHandler(
-        entry_points=[CommandHandler("subirquiz", subir_quiz)],
-        states={
-            ESPERANDO_NOMBRE_QUIZ: [
-                CallbackQueryHandler(seleccionar_curso_quiz, pattern="^selcurso_"),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, recibir_nombre_quiz)
-            ],
-            ESPERANDO_PDF: [MessageHandler(filters.TEXT & ~filters.COMMAND, recibir_nombre_quiz)],
-            REVISANDO_NOMBRES: [MessageHandler(filters.Document.PDF, recibir_pdf)],
-        },
-        fallbacks=[]
-    )
-
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("estado", estado))
-    app.add_handler(CommandHandler("micursos", mis_cursos))
-    app.add_handler(conv_curso)
-    app.add_handler(conv_quiz)
-
-    logger.info("Bot del profe iniciado...")
-    app.run_polling()
-
-if __name__ == "__main__":
-    main()
+@app.post("/admin/desactivar-estudiante/{telegram_id}")
+def admin_desactivar_estudiante(telegram_id: int, db: Session = Depends(get_db)):
+    desactivar_estudiante(telegram_id, db)
+    return {"ok": True}
