@@ -62,64 +62,70 @@ def generar_excel(resultados, titulo):
     ws = wb.active
     ws.title = "Notas"
 
-    # Estilos
     header_font = Font(bold=True, color="FFFFFF")
     header_fill = PatternFill("solid", fgColor="1F4E79")
-    center = Alignment(horizontal="center")
+    title_font = Font(bold=True, size=13, color="1F4E79")
+    center = Alignment(horizontal="center", vertical="center")
+    left = Alignment(horizontal="left", vertical="center")
 
     # Título
-    ws.merge_cells("A1:F1")
+    ws.merge_cells("A1:D1")
     ws["A1"] = titulo
-    ws["A1"].font = Font(bold=True, size=14, color="1F4E79")
+    ws["A1"].font = title_font
     ws["A1"].alignment = center
+    ws.row_dimensions[1].height = 25
 
     # Encabezados
-    headers = ["#", "Estudiante", "Quiz", "Curso", "Nota (sobre 5)", "Porcentaje"]
-    for col, h in enumerate(headers, 1):
+    encabezados = ["#", "Estudiante", "Nota (sobre 5.0)", "Porcentaje"]
+    anchos = [5, 30, 18, 15]
+    for col, (h, ancho) in enumerate(zip(encabezados, anchos), 1):
         cell = ws.cell(row=2, column=col, value=h)
         cell.font = header_font
         cell.fill = header_fill
         cell.alignment = center
+        ws.column_dimensions[cell.column_letter].width = ancho
+    ws.row_dimensions[2].height = 20
 
     # Datos
     for i, r in enumerate(resultados, 1):
         nota = float(r.nota) if r.nota else 0
         porcentaje = float(r.porcentaje) if r.porcentaje else 0
+        fila = i + 2
 
-        ws.cell(row=i+2, column=1, value=i)
-        ws.cell(row=i+2, column=2, value=r.nombre_temp or "")
-        ws.cell(row=i+2, column=3, value=r.quiz_nombre or "")
-        ws.cell(row=i+2, column=4, value=r.curso_nombre or "")
-        ws.cell(row=i+2, column=5, value=nota)
-        ws.cell(row=i+2, column=6, value=f"{porcentaje}%")
+        ws.cell(row=fila, column=1, value=i).alignment = center
+        ws.cell(row=fila, column=2, value=r.nombre_temp or "").alignment = left
+        ws.cell(row=fila, column=3, value=f"{nota:.2f} / 5.0").alignment = center
+        ws.cell(row=fila, column=4, value=f"{porcentaje:.1f}%").alignment = center
 
-        # Color por nota
-        nota_cell = ws.cell(row=i+2, column=5)
+        nota_cell = ws.cell(row=fila, column=3)
         if nota >= 3.5:
-            nota_cell.fill = PatternFill("solid", fgColor="C6EFCE")  # verde
+            nota_cell.fill = PatternFill("solid", fgColor="C6EFCE")
+            nota_cell.font = Font(color="276221", bold=True)
         elif nota >= 3.0:
-            nota_cell.fill = PatternFill("solid", fgColor="FFEB9C")  # amarillo
+            nota_cell.fill = PatternFill("solid", fgColor="FFEB9C")
+            nota_cell.font = Font(color="9C5700", bold=True)
         else:
-            nota_cell.fill = PatternFill("solid", fgColor="FFC7CE")  # rojo
+            nota_cell.fill = PatternFill("solid", fgColor="FFC7CE")
+            nota_cell.font = Font(color="9C0006", bold=True)
 
-    # Ancho de columnas
-    ws.column_dimensions["A"].width = 5
-    ws.column_dimensions["B"].width = 25
-    ws.column_dimensions["C"].width = 25
-    ws.column_dimensions["D"].width = 20
-    ws.column_dimensions["E"].width = 15
-    ws.column_dimensions["F"].width = 12
+        ws.row_dimensions[fila].height = 18
 
     # Promedio
     total = len(resultados)
     if total > 0:
         promedio = sum(float(r.nota) for r in resultados if r.nota) / total
-        fila_prom = total + 3
-        ws.cell(row=fila_prom, column=1, value="Promedio del grupo:")
-        ws.cell(row=fila_prom, column=1).font = Font(bold=True)
-        ws.cell(row=fila_prom, column=5, value=round(promedio, 2))
-        ws.cell(row=fila_prom, column=5).font = Font(bold=True)
-        ws.cell(row=fila_prom+1, column=1, value=f"Total estudiantes: {total}")
+        aprobados = sum(1 for r in resultados if r.nota and float(r.nota) >= 3.0)
+        fila_prom = total + 4
+
+        ws.merge_cells(f"A{fila_prom}:D{fila_prom}")
+        ws[f"A{fila_prom}"] = f"Total: {total}  |  Aprobados: {aprobados}  |  Reprobados: {total - aprobados}"
+        ws[f"A{fila_prom}"].font = Font(bold=True, color="1F4E79")
+
+        ws[f"A{fila_prom+1}"] = "Promedio del grupo:"
+        ws[f"A{fila_prom+1}"].font = Font(bold=True)
+        ws[f"C{fila_prom+1}"] = f"{promedio:.2f} / 5.0"
+        ws[f"C{fila_prom+1}"].font = Font(bold=True, color="1F4E79")
+        ws[f"C{fila_prom+1}"].alignment = Alignment(horizontal="center")
 
     buffer = io.BytesIO()
     wb.save(buffer)
@@ -210,7 +216,6 @@ async def webhook_profe(request: Request, db: Session = Depends(get_db)):
                     f"📚 Curso: <b>{curso.nombre} - {curso.grado}</b>\n\n✏️ Escribe el nombre del quiz:\nEjemplo: <b>Quiz 1 Primer Periodo</b>")
 
         elif cb_data.startswith("excel_quiz_"):
-            # Callback para elegir quiz específico para Excel
             partes = cb_data.replace("excel_quiz_", "").split("|", 1)
             curso_buscar = partes[0]
             quiz_buscar = partes[1] if len(partes) > 1 else ""
@@ -220,8 +225,7 @@ async def webhook_profe(request: Request, db: Session = Depends(get_db)):
                 Resultado.confirmado == True
             ).all()
             if not resultados:
-                await send_message(BOT_PROFE_TOKEN, chat_id,
-                    f"❌ No hay resultados para {quiz_buscar}.")
+                await send_message(BOT_PROFE_TOKEN, chat_id, f"❌ No hay resultados para {quiz_buscar}.")
             else:
                 titulo = f"Notas - {curso_buscar} - {quiz_buscar}"
                 excel_bytes = generar_excel(resultados, titulo)
@@ -236,8 +240,7 @@ async def webhook_profe(request: Request, db: Session = Depends(get_db)):
                 Resultado.confirmado == True
             ).all()
             if not resultados:
-                await send_message(BOT_PROFE_TOKEN, chat_id,
-                    f"❌ No hay resultados para {curso_buscar}.")
+                await send_message(BOT_PROFE_TOKEN, chat_id, f"❌ No hay resultados para {curso_buscar}.")
             else:
                 titulo = f"Todas las notas - {curso_buscar}"
                 excel_bytes = generar_excel(resultados, titulo)
@@ -311,12 +314,10 @@ async def webhook_profe(request: Request, db: Session = Depends(get_db)):
         if not profe or not profe.activo:
             await send_message(BOT_PROFE_TOKEN, chat_id, "❌ Necesitas suscripcion activa.")
             return {"ok": True}
-        # Mostrar cursos disponibles con resultados
         cursos_con_datos = db.query(Resultado.curso_nombre).filter(
             Resultado.confirmado == True,
             Resultado.curso_nombre != None
         ).distinct().all()
-
         if not cursos_con_datos:
             await send_message(BOT_PROFE_TOKEN, chat_id, "❌ No hay resultados guardados aún.")
         else:
@@ -350,7 +351,6 @@ async def webhook_profe(request: Request, db: Session = Depends(get_db)):
                 await send_message(BOT_PROFE_TOKEN, chat_id, "📄 PDF del quiz recibido. Subiendo...")
                 nombre_archivo = f"quizzes/{uuid.uuid4()}.pdf"
                 quiz_pdf_url = subir_pdf_r2(file_bytes, nombre_archivo)
-
                 if quiz_pdf_url:
                     for r in resultados_pendientes:
                         r.quiz_pdf_url = quiz_pdf_url
@@ -362,8 +362,7 @@ async def webhook_profe(request: Request, db: Session = Depends(get_db)):
                     await send_message(BOT_PROFE_TOKEN, chat_id, "❌ Error subiendo el PDF.")
             else:
                 if not curso_info:
-                    await send_message(BOT_PROFE_TOKEN, chat_id,
-                        "❌ Primero selecciona un curso con /subirquiz")
+                    await send_message(BOT_PROFE_TOKEN, chat_id, "❌ Primero selecciona un curso con /subirquiz")
                     return {"ok": True}
 
                 curso_id, curso_nombre = curso_info.split("|", 1)
@@ -430,14 +429,11 @@ async def webhook_profe(request: Request, db: Session = Depends(get_db)):
         elif paso == "esperando_materia_excel":
             materia = text.strip()
             del_estado(db, telegram_id, "paso")
-
-            # Buscar quizzes disponibles para esa materia
             quizzes = db.query(Resultado.quiz_nombre).filter(
                 Resultado.curso_nombre.ilike(f"%{materia}%"),
                 Resultado.confirmado == True,
                 Resultado.quiz_nombre != None
             ).distinct().all()
-
             if not quizzes:
                 await send_message(BOT_PROFE_TOKEN, chat_id,
                     f"❌ No encontré resultados para <b>{materia}</b>.")
@@ -454,7 +450,6 @@ async def webhook_profe(request: Request, db: Session = Depends(get_db)):
                 Resultado.nombre_temp.like("PAG%"),
                 Resultado.confirmado == False
             ).all()
-
             if not resultados_db:
                 await send_message(BOT_PROFE_TOKEN, chat_id,
                     "❌ No encontré el PDF procesado. Por favor vuelve a enviar el PDF primero.")
@@ -487,7 +482,6 @@ async def webhook_profe(request: Request, db: Session = Depends(get_db)):
             await send_message(BOT_PROFE_TOKEN, chat_id,
                 f"✅ <b>{nombres_asignados} estudiantes guardados!</b>\n"
                 f"📚 Curso: <b>{curso_n}</b>\n📝 Quiz: <b>{quiz_n}</b>\n\n{resumen}\n\n"
-                f"✅ Los estudiantes ya pueden consultar sus notas.\n\n"
                 f"💡 Escribe <b>/excel</b> para generar un Excel con las notas.")
 
         else:
@@ -521,8 +515,7 @@ async def webhook_estudiante(request: Request, db: Session = Depends(get_db)):
                 f"• Escribir una <b>materia</b> (ej: matematicas) para ver notas de esa materia")
         else:
             await send_message(BOT_ESTUDIANTE_TOKEN, chat_id,
-                f"✅ Hola <b>{estudiante.nombre}</b>!\n\n"
-                f"Escribe tu nombre o una materia para ver tus notas.")
+                f"✅ Hola <b>{estudiante.nombre}</b>!\n\nEscribe tu nombre o una materia para ver tus notas.")
 
     elif text and not text.startswith("/"):
         busqueda = text.strip()
@@ -547,7 +540,7 @@ async def webhook_estudiante(request: Request, db: Session = Depends(get_db)):
                 ).all()
                 if not resultados:
                     await send_message(BOT_ESTUDIANTE_TOKEN, chat_id,
-                        f"❌ No encontré tus notas en <b>{busqueda}</b>.\n\nPrimero escribe tu nombre completo para registrarte.")
+                        f"❌ No encontré tus notas en <b>{busqueda}</b>.\n\nPrimero escribe tu nombre completo.")
                 else:
                     msg = f"📚 <b>Tus notas en {busqueda.title()}:</b>\n\n"
                     for r in resultados:
