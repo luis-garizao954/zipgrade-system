@@ -62,19 +62,16 @@ def generar_excel(resultados, titulo):
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "Notas"
-
     header_font = Font(bold=True, color="FFFFFF")
     header_fill = PatternFill("solid", fgColor="1F4E79")
     title_font = Font(bold=True, size=13, color="1F4E79")
     center = Alignment(horizontal="center", vertical="center")
     left = Alignment(horizontal="left", vertical="center")
-
     ws.merge_cells("A1:D1")
     ws["A1"] = titulo
     ws["A1"].font = title_font
     ws["A1"].alignment = center
     ws.row_dimensions[1].height = 25
-
     encabezados = ["#", "Estudiante", "Nota (sobre 5.0)", "Porcentaje"]
     anchos = [5, 30, 18, 15]
     for col, (h, ancho) in enumerate(zip(encabezados, anchos), 1):
@@ -84,17 +81,14 @@ def generar_excel(resultados, titulo):
         cell.alignment = center
         ws.column_dimensions[cell.column_letter].width = ancho
     ws.row_dimensions[2].height = 20
-
     for i, r in enumerate(resultados, 1):
         nota = float(r.nota) if r.nota else 0
         porcentaje = float(r.porcentaje) if r.porcentaje else 0
         fila = i + 2
-
         ws.cell(row=fila, column=1, value=i).alignment = center
         ws.cell(row=fila, column=2, value=r.nombre_temp or "").alignment = left
         ws.cell(row=fila, column=3, value=f"{nota:.2f} / 5.0").alignment = center
         ws.cell(row=fila, column=4, value=f"{porcentaje:.1f}%").alignment = center
-
         nota_cell = ws.cell(row=fila, column=3)
         if nota >= 3.5:
             nota_cell.fill = PatternFill("solid", fgColor="C6EFCE")
@@ -105,25 +99,20 @@ def generar_excel(resultados, titulo):
         else:
             nota_cell.fill = PatternFill("solid", fgColor="FFC7CE")
             nota_cell.font = Font(color="9C0006", bold=True)
-
         ws.row_dimensions[fila].height = 18
-
     total = len(resultados)
     if total > 0:
         promedio = sum(float(r.nota) for r in resultados if r.nota) / total
         aprobados = sum(1 for r in resultados if r.nota and float(r.nota) >= 3.0)
         fila_prom = total + 4
-
         ws.merge_cells(f"A{fila_prom}:D{fila_prom}")
         ws[f"A{fila_prom}"] = f"Total: {total}  |  Aprobados: {aprobados}  |  Reprobados: {total - aprobados}"
         ws[f"A{fila_prom}"].font = Font(bold=True, color="1F4E79")
-
         ws[f"A{fila_prom+1}"] = "Promedio del grupo:"
         ws[f"A{fila_prom+1}"].font = Font(bold=True)
         ws[f"C{fila_prom+1}"] = f"{promedio:.2f} / 5.0"
         ws[f"C{fila_prom+1}"].font = Font(bold=True, color="1F4E79")
         ws[f"C{fila_prom+1}"].alignment = Alignment(horizontal="center")
-
     buffer = io.BytesIO()
     wb.save(buffer)
     buffer.seek(0)
@@ -138,26 +127,20 @@ async def send_message(token, chat_id, text, reply_markup=None):
 
 async def send_photo(token, chat_id, photo_url, caption=""):
     async with httpx.AsyncClient() as client:
-        await client.post(
-            f"https://api.telegram.org/bot{token}/sendPhoto",
-            json={"chat_id": chat_id, "photo": photo_url, "caption": caption}
-        )
+        await client.post(f"https://api.telegram.org/bot{token}/sendPhoto",
+            json={"chat_id": chat_id, "photo": photo_url, "caption": caption})
 
 async def send_document_url(token, chat_id, doc_url, caption=""):
     async with httpx.AsyncClient() as client:
-        await client.post(
-            f"https://api.telegram.org/bot{token}/sendDocument",
-            json={"chat_id": chat_id, "document": doc_url, "caption": caption}
-        )
+        await client.post(f"https://api.telegram.org/bot{token}/sendDocument",
+            json={"chat_id": chat_id, "document": doc_url, "caption": caption})
 
 async def send_excel(token, chat_id, excel_bytes, filename, caption=""):
     async with httpx.AsyncClient(timeout=60) as client:
-        await client.post(
-            f"https://api.telegram.org/bot{token}/sendDocument",
+        await client.post(f"https://api.telegram.org/bot{token}/sendDocument",
             data={"chat_id": chat_id, "caption": caption},
             files={"document": (filename, excel_bytes,
-                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")}
-        )
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")})
 
 def get_estado(db, telegram_id, clave):
     r = db.query(Resultado).filter(
@@ -211,6 +194,16 @@ async def webhook_profe(request: Request, db: Session = Depends(get_db)):
                 set_estado(db, telegram_id, "paso", "esperando_nombre_quiz")
                 await send_message(BOT_PROFE_TOKEN, chat_id,
                     f"📚 Curso: <b>{curso.nombre} - {curso.grado}</b>\n\n✏️ Escribe el nombre del quiz:\nEjemplo: <b>Quiz 1 Primer Periodo</b>")
+
+        elif cb_data.startswith("avisar_curso_"):
+            curso_id = cb_data.replace("avisar_curso_", "")
+            curso = db.query(Curso).filter(Curso.id == curso_id).first()
+            if curso:
+                set_estado(db, telegram_id, "avisar_curso", f"{curso_id}|{curso.nombre}")
+                set_estado(db, telegram_id, "paso", "esperando_mensaje_aviso")
+                await send_message(BOT_PROFE_TOKEN, chat_id,
+                    f"📢 Curso seleccionado: <b>{curso.nombre} - {curso.grado}</b>\n\n"
+                    f"✏️ Escribe el mensaje que quieres enviar a todos los estudiantes de este curso:")
 
         elif cb_data.startswith("excel_quiz_"):
             partes = cb_data.replace("excel_quiz_", "").split("|", 1)
@@ -268,7 +261,13 @@ async def webhook_profe(request: Request, db: Session = Depends(get_db)):
         else:
             if profe.activo:
                 await send_message(BOT_PROFE_TOKEN, chat_id,
-                    f"✅ Hola <b>{profe.nombre}</b>!\n\n📋 Comandos:\n/micursos - Ver tus cursos\n/nuevocurso - Crear un curso\n/subirquiz - Subir quiz\n/excel - Generar Excel de notas\n/estado - Ver suscripcion")
+                    f"✅ Hola <b>{profe.nombre}</b>!\n\n📋 Comandos:\n"
+                    f"/micursos - Ver tus cursos\n"
+                    f"/nuevocurso - Crear un curso\n"
+                    f"/subirquiz - Subir quiz\n"
+                    f"/excel - Generar Excel de notas\n"
+                    f"/avisar - Enviar aviso a un curso\n"
+                    f"/estado - Ver suscripcion")
             else:
                 await send_message(BOT_PROFE_TOKEN, chat_id, "❌ Tu suscripcion no esta activa.")
 
@@ -285,7 +284,9 @@ async def webhook_profe(request: Request, db: Session = Depends(get_db)):
         if not cursos:
             await send_message(BOT_PROFE_TOKEN, chat_id, "No tienes cursos. Usa /nuevocurso para crear uno.")
         else:
-            lista = "\n".join([f"📚 <b>{c.nombre}</b> - {c.grado}" for c in cursos])
+            for c in cursos:
+                total_est = db.query(CursoEstudiante).filter(CursoEstudiante.curso_id == c.id).count()
+                lista = f"📚 <b>{c.nombre} - {c.grado}</b> ({total_est} estudiantes inscritos)\n"
             await send_message(BOT_PROFE_TOKEN, chat_id, f"Tus cursos:\n\n{lista}")
 
     elif text == "/nuevocurso":
@@ -306,6 +307,25 @@ async def webhook_profe(request: Request, db: Session = Depends(get_db)):
         else:
             botones = {"inline_keyboard": [[{"text": f"📚 {c.nombre} - {c.grado}", "callback_data": f"curso_{c.id}"}] for c in cursos]}
             await send_message(BOT_PROFE_TOKEN, chat_id, "¿A qué curso pertenece este quiz?", reply_markup=botones)
+
+    elif text == "/avisar":
+        if not profe or not profe.activo:
+            await send_message(BOT_PROFE_TOKEN, chat_id, "❌ Necesitas suscripcion activa.")
+            return {"ok": True}
+        cursos = db.query(Curso).filter(Curso.profe_id == profe.id).all()
+        if not cursos:
+            await send_message(BOT_PROFE_TOKEN, chat_id, "No tienes cursos. Usa /nuevocurso para crear uno.")
+        else:
+            botones = {"inline_keyboard": []}
+            for c in cursos:
+                total_est = db.query(CursoEstudiante).filter(CursoEstudiante.curso_id == c.id).count()
+                botones["inline_keyboard"].append([{
+                    "text": f"📚 {c.nombre} - {c.grado} ({total_est} estudiantes)",
+                    "callback_data": f"avisar_curso_{c.id}"
+                }])
+            await send_message(BOT_PROFE_TOKEN, chat_id,
+                "📢 ¿A qué curso quieres enviar el aviso?",
+                reply_markup=botones)
 
     elif text == "/excel" or text.lower().startswith("excel"):
         if not profe or not profe.activo:
@@ -334,7 +354,7 @@ async def webhook_profe(request: Request, db: Session = Depends(get_db)):
                 await send_message(BOT_PROFE_TOKEN, chat_id, "✅ Respuesta enviada al estudiante.")
             except Exception as e:
                 await send_message(BOT_PROFE_TOKEN, chat_id,
-                    f"❌ Error al enviar: {str(e)}\nFormato: <code>/responder ID_ESTUDIANTE tu respuesta</code>")
+                    f"❌ Error: {str(e)}\nFormato: <code>/responder ID_ESTUDIANTE tu respuesta</code>")
         else:
             await send_message(BOT_PROFE_TOKEN, chat_id,
                 "❌ Formato incorrecto.\nUsa: <code>/responder ID_ESTUDIANTE tu respuesta aqui</code>")
@@ -342,7 +362,6 @@ async def webhook_profe(request: Request, db: Session = Depends(get_db)):
     elif document:
         file_name = document.get("file_name", "")
         file_id = document.get("file_id")
-
         async with httpx.AsyncClient(timeout=60) as client:
             r = await client.get(f"https://api.telegram.org/bot{BOT_PROFE_TOKEN}/getFile",
                 params={"file_id": file_id})
@@ -354,7 +373,6 @@ async def webhook_profe(request: Request, db: Session = Depends(get_db)):
             paso = get_estado(db, telegram_id, "paso")
             curso_info = get_estado(db, telegram_id, "curso_seleccionado")
             quiz_nombre = get_estado(db, telegram_id, "quiz_nombre")
-
             resultados_pendientes = db.query(Resultado).filter(
                 Resultado.nombre_temp.like("PAG%"),
                 Resultado.confirmado == False
@@ -377,22 +395,18 @@ async def webhook_profe(request: Request, db: Session = Depends(get_db)):
                 if not curso_info:
                     await send_message(BOT_PROFE_TOKEN, chat_id, "❌ Primero selecciona un curso con /subirquiz")
                     return {"ok": True}
-
                 curso_id, curso_nombre = curso_info.split("|", 1)
                 qnombre = quiz_nombre or "Quiz"
-
                 await send_message(BOT_PROFE_TOKEN, chat_id,
                     f"📎 PDF de ZipGrade recibido.\n📚 Curso: <b>{curso_nombre}</b>\n📝 Quiz: <b>{qnombre}</b>\n\n⏳ Procesando...")
                 try:
                     resultados_lista = await procesar_pdf_zipgrade(file_bytes)
                     total = len(resultados_lista)
-
                     db.query(Resultado).filter(
                         Resultado.nombre_temp.like("PAG%"),
                         Resultado.confirmado == False
                     ).delete(synchronize_session=False)
                     db.commit()
-
                     for r in resultados_lista:
                         nuevo_r = Resultado(
                             id=uuid.uuid4(),
@@ -410,12 +424,10 @@ async def webhook_profe(request: Request, db: Session = Depends(get_db)):
                         db.add(nuevo_r)
                     db.commit()
                     set_estado(db, telegram_id, "paso", "esperando_pdf_quiz")
-
                     resumen = "\n".join([f"• <b>{r['nombre']}</b>: {r['nota']}/5.0 ({r['porcentaje']}%)" for r in resultados_lista])
                     await send_message(BOT_PROFE_TOKEN, chat_id,
                         f"✅ PDF procesado: <b>{total} estudiantes</b>\n\n{resumen}\n\n"
                         f"📄 Ahora envíame el PDF del quiz (las preguntas).")
-
                 except Exception as e:
                     await send_message(BOT_PROFE_TOKEN, chat_id, f"❌ Error procesando PDF: {str(e)}")
 
@@ -438,6 +450,36 @@ async def webhook_profe(request: Request, db: Session = Depends(get_db)):
             set_estado(db, telegram_id, "paso", "esperando_pdf_zipgrade")
             await send_message(BOT_PROFE_TOKEN, chat_id,
                 f"✅ Quiz: <b>{text.strip()}</b>\n\n📎 Ahora envíame el PDF de ZipGrade.")
+
+        elif paso == "esperando_mensaje_aviso":
+            aviso_info = get_estado(db, telegram_id, "avisar_curso")
+            if not aviso_info:
+                await send_message(BOT_PROFE_TOKEN, chat_id, "❌ Error. Usa /avisar de nuevo.")
+                return {"ok": True}
+            curso_id, curso_nombre = aviso_info.split("|", 1)
+            mensaje_aviso = text.strip()
+            inscripciones = db.query(CursoEstudiante).filter(
+                CursoEstudiante.curso_id == curso_id
+            ).all()
+            if not inscripciones:
+                await send_message(BOT_PROFE_TOKEN, chat_id,
+                    f"⚠️ No hay estudiantes inscritos en <b>{curso_nombre}</b> aún.\n\n"
+                    f"Los estudiantes se inscriben al entrar al bot del estudiante y elegir su curso.")
+            else:
+                enviados = 0
+                for ins in inscripciones:
+                    est = db.query(Estudiante).filter(Estudiante.id == ins.estudiante_id).first()
+                    if est:
+                        try:
+                            await send_message(BOT_ESTUDIANTE_TOKEN, est.telegram_id,
+                                f"📢 <b>Aviso de tu profe - {curso_nombre}:</b>\n\n{mensaje_aviso}")
+                            enviados += 1
+                        except:
+                            pass
+                await send_message(BOT_PROFE_TOKEN, chat_id,
+                    f"✅ Aviso enviado a <b>{enviados} estudiantes</b> del curso <b>{curso_nombre}</b>.")
+            del_estado(db, telegram_id, "paso")
+            del_estado(db, telegram_id, "avisar_curso")
 
         elif paso == "esperando_materia_excel":
             materia = text.strip()
@@ -467,7 +509,6 @@ async def webhook_profe(request: Request, db: Session = Depends(get_db)):
                 await send_message(BOT_PROFE_TOKEN, chat_id,
                     "❌ No encontré el PDF procesado. Por favor vuelve a enviar el PDF primero.")
                 return {"ok": True}
-
             lineas = [l.strip() for l in text.split('\n') if l.strip() and l.strip()[:3] == "PAG"]
             nombres_asignados = 0
             for linea in lineas:
@@ -484,11 +525,9 @@ async def webhook_profe(request: Request, db: Session = Depends(get_db)):
                 except:
                     continue
             db.commit()
-
             del_estado(db, telegram_id, "paso")
             del_estado(db, telegram_id, "curso_seleccionado")
             del_estado(db, telegram_id, "quiz_nombre")
-
             curso_n = resultados_db[0].curso_nombre if resultados_db else ""
             quiz_n = resultados_db[0].quiz_nombre if resultados_db else ""
             resumen = "\n".join([f"• <b>{r.nombre_temp}</b>: {r.nota}/5.0" for r in resultados_db])
@@ -499,7 +538,7 @@ async def webhook_profe(request: Request, db: Session = Depends(get_db)):
 
         else:
             await send_message(BOT_PROFE_TOKEN, chat_id,
-                "Comandos:\n/start\n/micursos\n/nuevocurso\n/subirquiz\n/excel\n/estado")
+                "Comandos:\n/start\n/micursos\n/nuevocurso\n/subirquiz\n/excel\n/avisar\n/estado")
 
     return {"ok": True}
 
@@ -511,6 +550,34 @@ async def webhook_estudiante(request: Request, db: Session = Depends(get_db)):
     text = message.get("text", "")
     telegram_id = message.get("from", {}).get("id")
     nombre = message.get("from", {}).get("first_name", "Estudiante")
+    callback = data.get("callback_query", {})
+
+    if callback:
+        cb_chat_id = callback.get("from", {}).get("id")
+        cb_telegram_id = cb_chat_id
+        cb_data = callback.get("data", "")
+
+        if cb_data.startswith("inscribir_"):
+            curso_id = cb_data.replace("inscribir_", "")
+            curso = db.query(Curso).filter(Curso.id == curso_id).first()
+            if curso:
+                est = db.query(Estudiante).filter(Estudiante.telegram_id == cb_telegram_id).first()
+                if est:
+                    ya_inscrito = db.query(CursoEstudiante).filter(
+                        CursoEstudiante.curso_id == curso_id,
+                        CursoEstudiante.estudiante_id == est.id
+                    ).first()
+                    if not ya_inscrito:
+                        db.add(CursoEstudiante(curso_id=curso_id, estudiante_id=est.id))
+                        db.commit()
+                        await send_message(BOT_ESTUDIANTE_TOKEN, cb_chat_id,
+                            f"✅ Te inscribiste en <b>{curso.nombre} - {curso.grado}</b>!\n\n"
+                            f"Ahora recibirás los avisos de tu profe para este curso.\n"
+                            f"Escribe tu nombre para ver tus notas.")
+                    else:
+                        await send_message(BOT_ESTUDIANTE_TOKEN, cb_chat_id,
+                            f"Ya estás inscrito en <b>{curso.nombre}</b>.")
+        return {"ok": True}
 
     if not chat_id:
         return {"ok": True}
@@ -522,15 +589,42 @@ async def webhook_estudiante(request: Request, db: Session = Depends(get_db)):
             nuevo = Estudiante(id=uuid.uuid4(), telegram_id=telegram_id, nombre=nombre, apellido="", activo=True)
             db.add(nuevo)
             db.commit()
+            estudiante = nuevo
+
+        todos_cursos = db.query(Curso).all()
+        if todos_cursos:
+            botones = {"inline_keyboard": [[{
+                "text": f"📚 {c.nombre} - {c.grado}",
+                "callback_data": f"inscribir_{c.id}"
+            }] for c in todos_cursos]}
             await send_message(BOT_ESTUDIANTE_TOKEN, chat_id,
-                f"👋 Hola <b>{nombre}</b>!\n\nBienvenido al sistema ZipGrade.\n\n"
-                f"Puedes:\n• Escribir tu <b>nombre</b> para ver todas tus notas\n"
-                f"• Escribir una <b>materia</b> (ej: matematicas) para ver notas de esa materia\n"
-                f"• Usar /duda para enviarle un mensaje a tu profe")
+                f"👋 Hola <b>{nombre}</b>! Bienvenido al sistema ZipGrade.\n\n"
+                f"Selecciona tu curso para inscribirte y recibir avisos:",
+                reply_markup=botones)
         else:
             await send_message(BOT_ESTUDIANTE_TOKEN, chat_id,
-                f"✅ Hola <b>{estudiante.nombre}</b>!\n\n"
-                f"Escribe tu nombre, una materia, o usa /duda para contactar a tu profe.")
+                f"👋 Hola <b>{nombre}</b>! Bienvenido.\n\n"
+                f"Escribe tu nombre completo para ver tus notas.\n"
+                f"Usa /duda para contactar a tu profe.")
+
+    elif text == "/miscursos":
+        if not estudiante:
+            await send_message(BOT_ESTUDIANTE_TOKEN, chat_id, "Primero escribe /start")
+            return {"ok": True}
+        inscripciones = db.query(CursoEstudiante).filter(
+            CursoEstudiante.estudiante_id == estudiante.id
+        ).all()
+        if not inscripciones:
+            await send_message(BOT_ESTUDIANTE_TOKEN, chat_id,
+                "No estás inscrito en ningún curso. Escribe /start para ver los cursos disponibles.")
+        else:
+            cursos_list = []
+            for ins in inscripciones:
+                c = db.query(Curso).filter(Curso.id == ins.curso_id).first()
+                if c:
+                    cursos_list.append(f"📚 <b>{c.nombre} - {c.grado}</b>")
+            await send_message(BOT_ESTUDIANTE_TOKEN, chat_id,
+                f"Tus cursos inscritos:\n\n" + "\n".join(cursos_list))
 
     elif text == "/duda":
         set_estado(db, telegram_id, "esperando_duda", "si")
@@ -552,12 +646,10 @@ async def webhook_estudiante(request: Request, db: Session = Depends(get_db)):
                 "✅ Tu mensaje fue enviado a tu profe. Te responderá pronto.")
         else:
             busqueda = text.strip()
-
             resultados_materia = db.query(Resultado).filter(
                 Resultado.curso_nombre.ilike(f"%{busqueda}%"),
                 Resultado.confirmado == True
             ).all()
-
             resultados_nombre = db.query(Resultado).filter(
                 Resultado.nombre_temp.ilike(f"%{busqueda}%"),
                 Resultado.confirmado == True
@@ -595,7 +687,6 @@ async def webhook_estudiante(request: Request, db: Session = Depends(get_db)):
                 if est and est.nombre != busqueda:
                     est.nombre = busqueda
                     db.commit()
-
                 msg = f"📊 <b>Todas tus notas ({busqueda}):</b>\n\n"
                 for r in resultados_nombre:
                     curso = r.curso_nombre or "Sin curso"
