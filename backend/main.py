@@ -13,7 +13,6 @@ import uuid, os, httpx, io
 import boto3
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment
-from datetime import datetime, timedelta
 
 app = FastAPI(title="ZipGrade System API", version="1.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -31,7 +30,6 @@ R2_SECRET_KEY = os.getenv("R2_SECRET_KEY", "")
 R2_BUCKET_NAME = os.getenv("R2_BUCKET_NAME", "zipgrade-pdfs")
 R2_PUBLIC_URL = os.getenv("R2_PUBLIC_URL", "")
 PROFE_CHAT_ID = 8911705192
-DIAS_PRUEBA = 15
 
 def get_db():
     db = SessionLocal()
@@ -39,50 +37,6 @@ def get_db():
         yield db
     finally:
         db.close()
-
-def verificar_acceso_profe(profe):
-    """Retorna (tiene_acceso, dias_restantes, mensaje)"""
-    ahora = datetime.utcnow()
-    if profe.activo:
-        return True, None, None
-    if profe.en_prueba and profe.prueba_fin:
-        if ahora <= profe.prueba_fin:
-            dias = (profe.prueba_fin - ahora).days
-            return True, dias, None
-        else:
-            return False, 0, "🔒 Tu prueba gratuita de 15 días ha vencido.\n\nPara continuar usando el sistema contacta al administrador para activar tu suscripción."
-    if profe.en_prueba and not profe.prueba_fin:
-        return True, None, None
-    return False, 0, "❌ Tu suscripción no está activa. Contacta al administrador."
-
-def verificar_acceso_estudiante(estudiante):
-    """Retorna (tiene_acceso, dias_restantes, mensaje)"""
-    ahora = datetime.utcnow()
-    if estudiante.activo:
-        return True, None, None
-    if estudiante.en_prueba and estudiante.prueba_fin:
-        if ahora <= estudiante.prueba_fin:
-            dias = (estudiante.prueba_fin - ahora).days
-            return True, dias, None
-        else:
-            return False, 0, "🔒 Tu prueba gratuita de 15 días ha vencido.\n\nContacta a tu profe para renovar tu acceso."
-    if estudiante.en_prueba and not estudiante.prueba_fin:
-        return True, None, None
-    return False, 0, "❌ Tu acceso no está activo. Contacta a tu profe."
-
-def iniciar_prueba_profe(db, profe):
-    if not profe.prueba_inicio:
-        profe.prueba_inicio = datetime.utcnow()
-        profe.prueba_fin = datetime.utcnow() + timedelta(days=DIAS_PRUEBA)
-        profe.en_prueba = True
-        db.commit()
-
-def iniciar_prueba_estudiante(db, estudiante):
-    if not estudiante.prueba_inicio:
-        estudiante.prueba_inicio = datetime.utcnow()
-        estudiante.prueba_fin = datetime.utcnow() + timedelta(days=DIAS_PRUEBA)
-        estudiante.en_prueba = True
-        db.commit()
 
 def subir_pdf_r2(pdf_bytes: bytes, nombre_archivo: str) -> str:
     try:
@@ -248,7 +202,8 @@ async def webhook_profe(request: Request, db: Session = Depends(get_db)):
                 set_estado(db, telegram_id, "avisar_curso", f"{curso_id}|{curso.nombre}")
                 set_estado(db, telegram_id, "paso", "esperando_mensaje_aviso")
                 await send_message(BOT_PROFE_TOKEN, chat_id,
-                    f"📢 Curso: <b>{curso.nombre} - {curso.grado}</b>\n\n✏️ Escribe el mensaje para los estudiantes:")
+                    f"📢 Curso seleccionado: <b>{curso.nombre} - {curso.grado}</b>\n\n"
+                    f"✏️ Escribe el mensaje que quieres enviar a todos los estudiantes de este curso:")
 
         elif cb_data.startswith("excel_quiz_"):
             partes = cb_data.replace("excel_quiz_", "").split("|", 1)
@@ -298,98 +253,53 @@ async def webhook_profe(request: Request, db: Session = Depends(get_db)):
 
     if text == "/start":
         if not profe:
-            nuevo = Profe(
-                id=uuid.uuid4(), telegram_id=telegram_id, nombre=nombre, email="",
-                activo=False, en_prueba=True,
-                prueba_inicio=datetime.utcnow(),
-                prueba_fin=datetime.utcnow() + timedelta(days=DIAS_PRUEBA)
-            )
+            nuevo = Profe(id=uuid.uuid4(), telegram_id=telegram_id, nombre=nombre, email="", activo=False)
             db.add(nuevo)
             db.commit()
             await send_message(BOT_PROFE_TOKEN, chat_id,
-                f"👋 Hola <b>{nombre}</b>! Bienvenido al sistema ZipGrade.\n\n"
-                f"🎉 Tienes <b>{DIAS_PRUEBA} días de prueba gratuita</b> para explorar todas las funciones.\n\n"
-                f"📋 Comandos:\n"
-                f"/micursos - Ver tus cursos\n"
-                f"/nuevocurso - Crear un curso\n"
-                f"/subirquiz - Subir quiz\n"
-                f"/excel - Generar Excel de notas\n"
-                f"/avisar - Enviar aviso a un curso\n"
-                f"/estado - Ver tu suscripcion")
+                f"👋 Hola <b>{nombre}</b>!\n\nTu cuenta fue creada. Contacta al administrador para activar tu suscripcion.")
         else:
-            iniciar_prueba_profe(db, profe)
-            tiene_acceso, dias, msg_error = verificar_acceso_profe(profe)
-            if tiene_acceso:
-                if dias is not None and dias <= 2:
-                    aviso = f"\n\n⚠️ <b>Tu prueba vence en {dias} día(s).</b> Contacta al administrador para continuar."
-                elif dias is not None:
-                    aviso = f"\n\n⏳ Prueba gratuita: <b>{dias} días restantes</b>"
-                else:
-                    aviso = ""
+            if profe.activo:
                 await send_message(BOT_PROFE_TOKEN, chat_id,
-                    f"✅ Hola <b>{profe.nombre}</b>!{aviso}\n\n📋 Comandos:\n"
+                    f"✅ Hola <b>{profe.nombre}</b>!\n\n📋 Comandos:\n"
                     f"/micursos - Ver tus cursos\n"
                     f"/nuevocurso - Crear un curso\n"
                     f"/subirquiz - Subir quiz\n"
                     f"/excel - Generar Excel de notas\n"
                     f"/avisar - Enviar aviso a un curso\n"
-                    f"/estado - Ver tu suscripcion")
+                    f"/estado - Ver suscripcion")
             else:
-                await send_message(BOT_PROFE_TOKEN, chat_id, msg_error)
+                await send_message(BOT_PROFE_TOKEN, chat_id, "❌ Tu suscripcion no esta activa.")
 
     elif text == "/estado":
         if profe:
-            tiene_acceso, dias, _ = verificar_acceso_profe(profe)
-            if profe.activo:
-                estado_txt = "✅ Suscripción activa"
-                vence = profe.suscripcion_hasta.strftime("%d/%m/%Y") if profe.suscripcion_hasta else "—"
-                await send_message(BOT_PROFE_TOKEN, chat_id,
-                    f"📊 <b>Tu suscripción</b>\n\n{estado_txt}\nVence: {vence}")
-            elif tiene_acceso and dias is not None:
-                await send_message(BOT_PROFE_TOKEN, chat_id,
-                    f"📊 <b>Tu suscripción</b>\n\n⏳ En periodo de prueba\nDías restantes: <b>{dias}</b>\n\n"
-                    f"Contacta al administrador para activar tu suscripción pagada.")
-            else:
-                await send_message(BOT_PROFE_TOKEN, chat_id,
-                    f"📊 <b>Tu suscripción</b>\n\n🔒 Prueba vencida\n\nContacta al administrador para activar.")
+            estado = "✅ Activa" if profe.activo else "❌ Inactiva"
+            await send_message(BOT_PROFE_TOKEN, chat_id, f"📊 Tu suscripcion: {estado}")
 
     elif text == "/micursos":
-        if not profe:
-            return {"ok": True}
-        iniciar_prueba_profe(db, profe)
-        tiene_acceso, dias, msg_error = verificar_acceso_profe(profe)
-        if not tiene_acceso:
-            await send_message(BOT_PROFE_TOKEN, chat_id, msg_error)
+        if not profe or not profe.activo:
+            await send_message(BOT_PROFE_TOKEN, chat_id, "❌ Necesitas suscripcion activa.")
             return {"ok": True}
         cursos = db.query(Curso).filter(Curso.profe_id == profe.id).all()
         if not cursos:
             await send_message(BOT_PROFE_TOKEN, chat_id, "No tienes cursos. Usa /nuevocurso para crear uno.")
         else:
-            lista = ""
             for c in cursos:
                 total_est = db.query(CursoEstudiante).filter(CursoEstudiante.curso_id == c.id).count()
-                lista += f"📚 <b>{c.nombre} - {c.grado}</b> ({total_est} estudiantes inscritos)\n"
+                lista = f"📚 <b>{c.nombre} - {c.grado}</b> ({total_est} estudiantes inscritos)\n"
             await send_message(BOT_PROFE_TOKEN, chat_id, f"Tus cursos:\n\n{lista}")
 
     elif text == "/nuevocurso":
-        if not profe:
-            return {"ok": True}
-        iniciar_prueba_profe(db, profe)
-        tiene_acceso, _, msg_error = verificar_acceso_profe(profe)
-        if not tiene_acceso:
-            await send_message(BOT_PROFE_TOKEN, chat_id, msg_error)
+        if not profe or not profe.activo:
+            await send_message(BOT_PROFE_TOKEN, chat_id, "❌ Necesitas suscripcion activa.")
             return {"ok": True}
         set_estado(db, telegram_id, "paso", "esperando_nombre_curso")
         await send_message(BOT_PROFE_TOKEN, chat_id,
             "✏️ Escribe el nombre y grado del curso:\nEjemplo: <b>Matematicas 9B</b>")
 
     elif text == "/subirquiz":
-        if not profe:
-            return {"ok": True}
-        iniciar_prueba_profe(db, profe)
-        tiene_acceso, _, msg_error = verificar_acceso_profe(profe)
-        if not tiene_acceso:
-            await send_message(BOT_PROFE_TOKEN, chat_id, msg_error)
+        if not profe or not profe.activo:
+            await send_message(BOT_PROFE_TOKEN, chat_id, "❌ Necesitas suscripcion activa.")
             return {"ok": True}
         cursos = db.query(Curso).filter(Curso.profe_id == profe.id).all()
         if not cursos:
@@ -399,12 +309,8 @@ async def webhook_profe(request: Request, db: Session = Depends(get_db)):
             await send_message(BOT_PROFE_TOKEN, chat_id, "¿A qué curso pertenece este quiz?", reply_markup=botones)
 
     elif text == "/avisar":
-        if not profe:
-            return {"ok": True}
-        iniciar_prueba_profe(db, profe)
-        tiene_acceso, _, msg_error = verificar_acceso_profe(profe)
-        if not tiene_acceso:
-            await send_message(BOT_PROFE_TOKEN, chat_id, msg_error)
+        if not profe or not profe.activo:
+            await send_message(BOT_PROFE_TOKEN, chat_id, "❌ Necesitas suscripcion activa.")
             return {"ok": True}
         cursos = db.query(Curso).filter(Curso.profe_id == profe.id).all()
         if not cursos:
@@ -417,15 +323,13 @@ async def webhook_profe(request: Request, db: Session = Depends(get_db)):
                     "text": f"📚 {c.nombre} - {c.grado} ({total_est} estudiantes)",
                     "callback_data": f"avisar_curso_{c.id}"
                 }])
-            await send_message(BOT_PROFE_TOKEN, chat_id, "📢 ¿A qué curso quieres enviar el aviso?", reply_markup=botones)
+            await send_message(BOT_PROFE_TOKEN, chat_id,
+                "📢 ¿A qué curso quieres enviar el aviso?",
+                reply_markup=botones)
 
     elif text == "/excel" or text.lower().startswith("excel"):
-        if not profe:
-            return {"ok": True}
-        iniciar_prueba_profe(db, profe)
-        tiene_acceso, _, msg_error = verificar_acceso_profe(profe)
-        if not tiene_acceso:
-            await send_message(BOT_PROFE_TOKEN, chat_id, msg_error)
+        if not profe or not profe.activo:
+            await send_message(BOT_PROFE_TOKEN, chat_id, "❌ Necesitas suscripcion activa.")
             return {"ok": True}
         cursos_con_datos = db.query(Resultado.curso_nombre).filter(
             Resultado.confirmado == True,
@@ -437,7 +341,7 @@ async def webhook_profe(request: Request, db: Session = Depends(get_db)):
             set_estado(db, telegram_id, "paso", "esperando_materia_excel")
             lista = "\n".join([f"• <b>{c[0]}</b>" for c in cursos_con_datos])
             await send_message(BOT_PROFE_TOKEN, chat_id,
-                f"📊 ¿De qué materia quieres el Excel?\n\nMaterias disponibles:\n{lista}\n\nEscribe el nombre:")
+                f"📊 ¿De qué materia quieres el Excel?\n\nMaterias disponibles:\n{lista}\n\nEscribe el nombre de la materia:")
 
     elif text and text.startswith("/responder"):
         partes = text.split(" ", 2)
@@ -456,14 +360,6 @@ async def webhook_profe(request: Request, db: Session = Depends(get_db)):
                 "❌ Formato incorrecto.\nUsa: <code>/responder ID_ESTUDIANTE tu respuesta aqui</code>")
 
     elif document:
-        if not profe:
-            return {"ok": True}
-        iniciar_prueba_profe(db, profe)
-        tiene_acceso, _, msg_error = verificar_acceso_profe(profe)
-        if not tiene_acceso:
-            await send_message(BOT_PROFE_TOKEN, chat_id, msg_error)
-            return {"ok": True}
-
         file_name = document.get("file_name", "")
         file_id = document.get("file_id")
         async with httpx.AsyncClient(timeout=60) as client:
@@ -502,7 +398,7 @@ async def webhook_profe(request: Request, db: Session = Depends(get_db)):
                 curso_id, curso_nombre = curso_info.split("|", 1)
                 qnombre = quiz_nombre or "Quiz"
                 await send_message(BOT_PROFE_TOKEN, chat_id,
-                    f"📎 PDF recibido.\n📚 Curso: <b>{curso_nombre}</b>\n📝 Quiz: <b>{qnombre}</b>\n\n⏳ Procesando...")
+                    f"📎 PDF de ZipGrade recibido.\n📚 Curso: <b>{curso_nombre}</b>\n📝 Quiz: <b>{qnombre}</b>\n\n⏳ Procesando...")
                 try:
                     resultados_lista = await procesar_pdf_zipgrade(file_bytes)
                     total = len(resultados_lista)
@@ -538,7 +434,7 @@ async def webhook_profe(request: Request, db: Session = Depends(get_db)):
     elif text and not text.startswith("/"):
         paso = get_estado(db, telegram_id, "paso")
 
-        if paso == "esperando_nombre_curso" and profe:
+        if paso == "esperando_nombre_curso" and profe and profe.activo:
             partes = text.rsplit(" ", 1)
             nom = partes[0]
             grado = partes[1] if len(partes) > 1 else ""
@@ -562,10 +458,13 @@ async def webhook_profe(request: Request, db: Session = Depends(get_db)):
                 return {"ok": True}
             curso_id, curso_nombre = aviso_info.split("|", 1)
             mensaje_aviso = text.strip()
-            inscripciones = db.query(CursoEstudiante).filter(CursoEstudiante.curso_id == curso_id).all()
+            inscripciones = db.query(CursoEstudiante).filter(
+                CursoEstudiante.curso_id == curso_id
+            ).all()
             if not inscripciones:
                 await send_message(BOT_PROFE_TOKEN, chat_id,
-                    f"⚠️ No hay estudiantes inscritos en <b>{curso_nombre}</b> aún.")
+                    f"⚠️ No hay estudiantes inscritos en <b>{curso_nombre}</b> aún.\n\n"
+                    f"Los estudiantes se inscriben al entrar al bot del estudiante y elegir su curso.")
             else:
                 enviados = 0
                 for ins in inscripciones:
@@ -598,7 +497,8 @@ async def webhook_profe(request: Request, db: Session = Depends(get_db)):
                 botones_lista.append([{"text": "📊 Todos los quizzes", "callback_data": f"excel_todos_{materia}"}])
                 botones = {"inline_keyboard": botones_lista}
                 await send_message(BOT_PROFE_TOKEN, chat_id,
-                    f"📚 <b>{materia}</b> — ¿De qué quiz quieres el Excel?", reply_markup=botones)
+                    f"📚 <b>{materia}</b> — ¿De qué quiz quieres el Excel?",
+                    reply_markup=botones)
 
         elif "PAG" in text[:5]:
             resultados_db = db.query(Resultado).filter(
@@ -656,6 +556,7 @@ async def webhook_estudiante(request: Request, db: Session = Depends(get_db)):
         cb_chat_id = callback.get("from", {}).get("id")
         cb_telegram_id = cb_chat_id
         cb_data = callback.get("data", "")
+
         if cb_data.startswith("inscribir_"):
             curso_id = cb_data.replace("inscribir_", "")
             curso = db.query(Curso).filter(Curso.id == curso_id).first()
@@ -671,6 +572,7 @@ async def webhook_estudiante(request: Request, db: Session = Depends(get_db)):
                         db.commit()
                         await send_message(BOT_ESTUDIANTE_TOKEN, cb_chat_id,
                             f"✅ Te inscribiste en <b>{curso.nombre} - {curso.grado}</b>!\n\n"
+                            f"Ahora recibirás los avisos de tu profe para este curso.\n"
                             f"Escribe tu nombre para ver tus notas.")
                     else:
                         await send_message(BOT_ESTUDIANTE_TOKEN, cb_chat_id,
@@ -684,78 +586,37 @@ async def webhook_estudiante(request: Request, db: Session = Depends(get_db)):
 
     if text == "/start":
         if not estudiante:
-            nuevo = Estudiante(
-                id=uuid.uuid4(), telegram_id=telegram_id, nombre=nombre, apellido="",
-                activo=False, en_prueba=True,
-                prueba_inicio=datetime.utcnow(),
-                prueba_fin=datetime.utcnow() + timedelta(days=DIAS_PRUEBA)
-            )
+            nuevo = Estudiante(id=uuid.uuid4(), telegram_id=telegram_id, nombre=nombre, apellido="", activo=True)
             db.add(nuevo)
             db.commit()
             estudiante = nuevo
-            todos_cursos = db.query(Curso).all()
-            if todos_cursos:
-                botones = {"inline_keyboard": [[{
-                    "text": f"📚 {c.nombre} - {c.grado}",
-                    "callback_data": f"inscribir_{c.id}"
-                }] for c in todos_cursos]}
-                await send_message(BOT_ESTUDIANTE_TOKEN, chat_id,
-                    f"👋 Hola <b>{nombre}</b>! Bienvenido al sistema ZipGrade.\n\n"
-                    f"🎉 Tienes <b>{DIAS_PRUEBA} días de prueba gratuita</b>.\n\n"
-                    f"Selecciona tu curso para inscribirte:",
-                    reply_markup=botones)
-            else:
-                await send_message(BOT_ESTUDIANTE_TOKEN, chat_id,
-                    f"👋 Hola <b>{nombre}</b>! Bienvenido.\n\n"
-                    f"🎉 Tienes <b>{DIAS_PRUEBA} días de prueba gratuita</b>.\n\n"
-                    f"Escribe tu nombre completo para ver tus notas.")
-        else:
-            iniciar_prueba_estudiante(db, estudiante)
-            tiene_acceso, dias, msg_error = verificar_acceso_estudiante(estudiante)
-            if not tiene_acceso:
-                await send_message(BOT_ESTUDIANTE_TOKEN, chat_id, msg_error)
-                return {"ok": True}
-            aviso = ""
-            if dias is not None and dias <= 2:
-                aviso = f"\n\n⚠️ <b>Tu prueba vence en {dias} día(s).</b> Contacta a tu profe para renovar."
-            elif dias is not None:
-                aviso = f"\n\n⏳ Prueba gratuita: <b>{dias} días restantes</b>"
-            todos_cursos = db.query(Curso).all()
-            if todos_cursos:
-                botones = {"inline_keyboard": [[{
-                    "text": f"📚 {c.nombre} - {c.grado}",
-                    "callback_data": f"inscribir_{c.id}"
-                }] for c in todos_cursos]}
-                await send_message(BOT_ESTUDIANTE_TOKEN, chat_id,
-                    f"✅ Hola <b>{estudiante.nombre}</b>!{aviso}\n\n"
-                    f"Selecciona un curso o escribe tu nombre para ver tus notas:",
-                    reply_markup=botones)
-            else:
-                await send_message(BOT_ESTUDIANTE_TOKEN, chat_id,
-                    f"✅ Hola <b>{estudiante.nombre}</b>!{aviso}\n\n"
-                    f"Escribe tu nombre para ver tus notas o /duda para contactar a tu profe.")
 
-    elif text == "/estado":
-        if estudiante:
-            tiene_acceso, dias, _ = verificar_acceso_estudiante(estudiante)
-            if estudiante.activo:
-                await send_message(BOT_ESTUDIANTE_TOKEN, chat_id,
-                    f"📊 <b>Tu suscripción</b>\n\n✅ Activa")
-            elif tiene_acceso and dias is not None:
-                await send_message(BOT_ESTUDIANTE_TOKEN, chat_id,
-                    f"📊 <b>Tu suscripción</b>\n\n⏳ En periodo de prueba\nDías restantes: <b>{dias}</b>")
-            else:
-                await send_message(BOT_ESTUDIANTE_TOKEN, chat_id,
-                    f"📊 <b>Tu suscripción</b>\n\n🔒 Prueba vencida\nContacta a tu profe.")
+        todos_cursos = db.query(Curso).all()
+        if todos_cursos:
+            botones = {"inline_keyboard": [[{
+                "text": f"📚 {c.nombre} - {c.grado}",
+                "callback_data": f"inscribir_{c.id}"
+            }] for c in todos_cursos]}
+            await send_message(BOT_ESTUDIANTE_TOKEN, chat_id,
+                f"👋 Hola <b>{nombre}</b>! Bienvenido al sistema ZipGrade.\n\n"
+                f"Selecciona tu curso para inscribirte y recibir avisos:",
+                reply_markup=botones)
+        else:
+            await send_message(BOT_ESTUDIANTE_TOKEN, chat_id,
+                f"👋 Hola <b>{nombre}</b>! Bienvenido.\n\n"
+                f"Escribe tu nombre completo para ver tus notas.\n"
+                f"Usa /duda para contactar a tu profe.")
 
     elif text == "/miscursos":
         if not estudiante:
             await send_message(BOT_ESTUDIANTE_TOKEN, chat_id, "Primero escribe /start")
             return {"ok": True}
-        inscripciones = db.query(CursoEstudiante).filter(CursoEstudiante.estudiante_id == estudiante.id).all()
+        inscripciones = db.query(CursoEstudiante).filter(
+            CursoEstudiante.estudiante_id == estudiante.id
+        ).all()
         if not inscripciones:
             await send_message(BOT_ESTUDIANTE_TOKEN, chat_id,
-                "No estás inscrito en ningún curso. Escribe /start para ver los cursos.")
+                "No estás inscrito en ningún curso. Escribe /start para ver los cursos disponibles.")
         else:
             cursos_list = []
             for ins in inscripciones:
@@ -766,23 +627,13 @@ async def webhook_estudiante(request: Request, db: Session = Depends(get_db)):
                 f"Tus cursos inscritos:\n\n" + "\n".join(cursos_list))
 
     elif text == "/duda":
-        if estudiante:
-            tiene_acceso, _, msg_error = verificar_acceso_estudiante(estudiante)
-            if not tiene_acceso:
-                await send_message(BOT_ESTUDIANTE_TOKEN, chat_id, msg_error)
-                return {"ok": True}
         set_estado(db, telegram_id, "esperando_duda", "si")
         await send_message(BOT_ESTUDIANTE_TOKEN, chat_id,
             "✏️ Escribe tu duda o pregunta y se la enviaré a tu profe:")
 
     elif text and not text.startswith("/"):
-        if estudiante:
-            tiene_acceso, _, msg_error = verificar_acceso_estudiante(estudiante)
-            if not tiene_acceso:
-                await send_message(BOT_ESTUDIANTE_TOKEN, chat_id, msg_error)
-                return {"ok": True}
-
         esperando = get_estado(db, telegram_id, "esperando_duda")
+
         if esperando == "si":
             del_estado(db, telegram_id, "esperando_duda")
             nombre_est = estudiante.nombre if estudiante else nombre
@@ -790,7 +641,7 @@ async def webhook_estudiante(request: Request, db: Session = Depends(get_db)):
                 f"📩 <b>Mensaje de estudiante:</b>\n\n"
                 f"👤 <b>{nombre_est}</b> (ID: <code>{telegram_id}</code>)\n\n"
                 f"💬 {text}\n\n"
-                f"Para responder:\n<code>/responder {telegram_id} tu respuesta aqui</code>")
+                f"Para responder escribe:\n<code>/responder {telegram_id} tu respuesta aqui</code>")
             await send_message(BOT_ESTUDIANTE_TOKEN, chat_id,
                 "✅ Tu mensaje fue enviado a tu profe. Te responderá pronto.")
         else:
