@@ -253,10 +253,22 @@ async def send_excel(token, chat_id, excel_bytes, filename, caption=""):
             files={"document": (filename, excel_bytes,
                 "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")})
 
-async def send_voice(token, chat_id, file_id, caption=""):
-    async with httpx.AsyncClient(timeout=60) as client:
-        await client.post(f"https://api.telegram.org/bot{token}/sendVoice",
-            json={"chat_id": chat_id, "voice": file_id, "caption": caption})
+async def send_voice(token, chat_id, file_id, source_token, caption=""):
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            # Obtener la URL del archivo desde el bot origen
+            r = await client.get(f"https://api.telegram.org/bot{source_token}/getFile",
+                params={"file_id": file_id})
+            file_path = r.json()["result"]["file_path"]
+            # Descargar el audio
+            audio_r = await client.get(f"https://api.telegram.org/file/bot{source_token}/{file_path}")
+            audio_bytes = audio_r.content
+            # Enviarlo con el bot destino
+            await client.post(f"https://api.telegram.org/bot{token}/sendVoice",
+                data={"chat_id": chat_id, "caption": caption},
+                files={"voice": ("voice.ogg", audio_bytes, "audio/ogg")})
+    except Exception as e:
+        print(f"Error enviando nota de voz: {e}")
 
 def get_estado(db, telegram_id, clave):
     r = db.query(Resultado).filter(
@@ -366,8 +378,8 @@ async def webhook_profe(request: Request, db: Session = Depends(get_db)):
             try:
                 estudiante_dest = int(paso.replace("responder_voz_", ""))
                 del_estado(db, telegram_id, "paso")
-                await send_voice(BOT_ESTUDIANTE_TOKEN, estudiante_dest, voice_file_id,
-                    "🎙️ Nota de voz de tu profe")
+                await send_voice(BOT_ESTUDIANTE_TOKEN, estudiante_dest, voice_file_id, BOT_PROFE_TOKEN,
+    "🎙️ Nota de voz de tu profe")
                 await send_message(BOT_PROFE_TOKEN, chat_id, "✅ Nota de voz enviada al estudiante.")
             except Exception as e:
                 await send_message(BOT_PROFE_TOKEN, chat_id,
@@ -726,7 +738,7 @@ async def webhook_estudiante(request: Request, db: Session = Depends(get_db)):
                 f"📚 Materia: <b>{materia_duda}</b>\n\n"
                 f"Para responder con texto: <code>/responder {telegram_id} tu respuesta</code>\n"
                 f"Para responder con voz: <code>/responder_voz {telegram_id}</code>")
-            await send_voice(BOT_PROFE_TOKEN, profe_dest, voice_file_id)
+           await send_voice(BOT_PROFE_TOKEN, profe_dest, voice_file_id, BOT_ESTUDIANTE_TOKEN)
             await send_message(BOT_ESTUDIANTE_TOKEN, chat_id,
                 f"✅ Tu nota de voz sobre <b>{materia_duda}</b> fue enviada a tu profe.")
         else:
