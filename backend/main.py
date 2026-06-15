@@ -253,6 +253,17 @@ async def send_excel(token, chat_id, excel_bytes, filename, caption=""):
             files={"document": (filename, excel_bytes,
                 "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")})
 
+async def send_voice(token, chat_id, file_id, caption=""):
+    async with httpx.AsyncClient(timeout=60) as client:
+        await client.post(f"https://api.telegram.org/bot{token}/sendVoice",
+            json={"chat_id": chat_id, "voice": file_id, "caption": caption})
+
+async def get_file_id(token, file_id_telegram):
+    async with httpx.AsyncClient(timeout=60) as client:
+        r = await client.get(f"https://api.telegram.org/bot{token}/getFile",
+            params={"file_id": file_id_telegram})
+        return r.json()
+
 def get_estado(db, telegram_id, clave):
     r = db.query(Resultado).filter(
         Resultado.nombre_temp == f"__estado__{telegram_id}__{clave}"
@@ -346,11 +357,28 @@ async def webhook_profe(request: Request, db: Session = Depends(get_db)):
     telegram_id = message.get("from", {}).get("id")
     nombre = message.get("from", {}).get("first_name", "Profe")
     document = message.get("document", {})
+    voice = message.get("voice", {})
 
     if not chat_id:
         return {"ok": True}
 
     profe = db.query(Profe).filter(Profe.telegram_id == telegram_id).first()
+
+    # NOTA DE VOZ DEL PROFE → reenviar al estudiante
+    if voice:
+        voice_file_id = voice.get("file_id")
+        # El profe debe haber escrito antes /responder_voz ID
+        paso = get_estado(db, telegram_id, "paso")
+        if paso and paso.startswith("responder_voz_"):
+            estudiante_dest = int(paso.replace("responder_voz_", ""))
+            del_estado(db, telegram_id, "paso")
+            await send_voice(BOT_ESTUDIANTE_TOKEN, estudiante_dest, voice_file_id,
+                "🎙️ Nota de voz de tu profe")
+            await send_message(BOT_PROFE_TOKEN, chat_id, "✅ Nota de voz enviada al estudiante.")
+        else:
+            await send_message(BOT_PROFE_TOKEN, chat_id,
+                "❌ Primero usa <code>/responder_voz ID_ESTUDIANTE</code> y luego envía la nota de voz.")
+        return {"ok": True}
 
     if text == "/start":
         if not profe:
@@ -362,7 +390,16 @@ async def webhook_profe(request: Request, db: Session = Depends(get_db)):
         else:
             if profe.activo:
                 await send_message(BOT_PROFE_TOKEN, chat_id,
-                    f"✅ Hola <b>{profe.nombre}</b>!\n\n📋 Comandos:\n/micursos - Ver tus cursos\n/nuevocurso - Crear un curso\n/subirquiz - Subir quiz\n/excel - Generar Excel de notas\n/estadisticas - Ver grafico del grupo\n/estado - Ver suscripcion")
+                    f"✅ Hola <b>{profe.nombre}</b>!\n\n📋 Comandos:\n"
+                    f"/micursos - Ver tus cursos\n"
+                    f"/nuevocurso - Crear un curso\n"
+                    f"/subirquiz - Subir quiz\n"
+                    f"/excel - Generar Excel de notas\n"
+                    f"/estadisticas - Ver grafico del grupo\n"
+                    f"/estado - Ver suscripcion\n\n"
+                    f"💬 Para responder a un estudiante:\n"
+                    f"• Texto: <code>/responder ID mensaje</code>\n"
+                    f"• Voz: <code>/responder_voz ID</code> y luego graba")
             else:
                 await send_message(BOT_PROFE_TOKEN, chat_id, "❌ Tu suscripcion no esta activa.")
 
@@ -437,6 +474,21 @@ async def webhook_profe(request: Request, db: Session = Depends(get_db)):
             lista = "\n".join([f"• <b>{c[0]}</b>" for c in cursos_con_datos])
             await send_message(BOT_PROFE_TOKEN, chat_id,
                 f"📊 ¿De qué materia quieres el Excel?\n\nMaterias disponibles:\n{lista}\n\nEscribe el nombre de la materia:")
+
+    elif text and text.startswith("/responder_voz"):
+        partes = text.split(" ", 1)
+        if len(partes) >= 2:
+            try:
+                estudiante_id = int(partes[1].strip())
+                set_estado(db, telegram_id, "paso", f"responder_voz_{estudiante_id}")
+                await send_message(BOT_PROFE_TOKEN, chat_id,
+                    f"🎙️ Listo. Ahora graba y envía tu nota de voz para el estudiante <code>{estudiante_id}</code>.")
+            except:
+                await send_message(BOT_PROFE_TOKEN, chat_id,
+                    "❌ Formato incorrecto.\nUsa: <code>/responder_voz ID_ESTUDIANTE</code>")
+        else:
+            await send_message(BOT_PROFE_TOKEN, chat_id,
+                "❌ Formato incorrecto.\nUsa: <code>/responder_voz ID_ESTUDIANTE</code>")
 
     elif text and text.startswith("/responder"):
         partes = text.split(" ", 2)
@@ -642,18 +694,47 @@ async def webhook_estudiante(request: Request, db: Session = Depends(get_db)):
             set_estado(db, telegram_id, "duda_profe_id", str(profe_tid))
             set_estado(db, telegram_id, "esperando_duda", "si")
             await send_message(BOT_ESTUDIANTE_TOKEN, chat_id,
-                f"📚 Materia: <b>{materia}</b>\n\n✏️ Escribe tu duda o pregunta:")
+                f"📚 Materia: <b>{materia}</b>\n\n"
+                f"✏️ Escribe tu duda o graba una nota de voz 🎙️:")
         return {"ok": True}
 
     chat_id = message.get("chat", {}).get("id")
     text = message.get("text", "")
     telegram_id = message.get("from", {}).get("id")
     nombre = message.get("from", {}).get("first_name", "Estudiante")
+    voice = message.get("voice", {})
 
     if not chat_id:
         return {"ok": True}
 
     estudiante = db.query(Estudiante).filter(Estudiante.telegram_id == telegram_id).first()
+
+    # NOTA DE VOZ DEL ESTUDIANTE → reenviar al profe
+    if voice:
+        esperando = get_estado(db, telegram_id, "esperando_duda")
+        if esperando == "si":
+            voice_file_id = voice.get("file_id")
+            del_estado(db, telegram_id, "esperando_duda")
+            nombre_est = estudiante.nombre if estudiante else nombre
+            materia_duda = get_estado(db, telegram_id, "duda_materia") or "Sin materia"
+            profe_id_str = get_estado(db, telegram_id, "duda_profe_id")
+            profe_dest = int(profe_id_str) if profe_id_str else PROFE_CHAT_ID
+            del_estado(db, telegram_id, "duda_materia")
+            del_estado(db, telegram_id, "duda_profe_id")
+
+            await send_message(BOT_PROFE_TOKEN, profe_dest,
+                f"🎙️ <b>Nota de voz de estudiante:</b>\n\n"
+                f"👤 <b>{nombre_est}</b> (ID: <code>{telegram_id}</code>)\n"
+                f"📚 Materia: <b>{materia_duda}</b>\n\n"
+                f"Para responder con texto: <code>/responder {telegram_id} tu respuesta</code>\n"
+                f"Para responder con voz: <code>/responder_voz {telegram_id}</code>")
+            await send_voice(BOT_PROFE_TOKEN, profe_dest, voice_file_id)
+            await send_message(BOT_ESTUDIANTE_TOKEN, chat_id,
+                f"✅ Tu nota de voz sobre <b>{materia_duda}</b> fue enviada a tu profe.")
+        else:
+            await send_message(BOT_ESTUDIANTE_TOKEN, chat_id,
+                "❌ Primero usa /duda para iniciar una consulta con tu profe.")
+        return {"ok": True}
 
     if text == "/start":
         if not estudiante:
@@ -665,11 +746,11 @@ async def webhook_estudiante(request: Request, db: Session = Depends(get_db)):
                 f"Puedes:\n• Escribir tu <b>nombre</b> para ver todas tus notas\n"
                 f"• Escribir una <b>materia</b> para ver notas de esa materia\n"
                 f"• Usar /grafico para ver tu grafico de rendimiento\n"
-                f"• Usar /duda para contactar a tu profe")
+                f"• Usar /duda para contactar a tu profe (texto o voz 🎙️)")
         else:
             await send_message(BOT_ESTUDIANTE_TOKEN, chat_id,
                 f"✅ Hola <b>{estudiante.nombre}</b>!\n\n"
-                f"Comandos:\n/grafico - Ver tu grafico de rendimiento\n/duda - Contactar al profe")
+                f"Comandos:\n/grafico - Ver tu grafico de rendimiento\n/duda - Contactar al profe (texto o voz)")
 
     elif text == "/duda":
         est = db.query(Estudiante).filter(Estudiante.telegram_id == telegram_id).first()
@@ -677,7 +758,6 @@ async def webhook_estudiante(request: Request, db: Session = Depends(get_db)):
             await send_message(BOT_ESTUDIANTE_TOKEN, chat_id,
                 "❌ Primero escribe tu nombre completo para registrarte.")
             return {"ok": True}
-        # Buscar materias del estudiante con el profe correspondiente
         materias = db.query(
             Resultado.curso_nombre,
             Resultado.profe_telegram_id
@@ -738,7 +818,8 @@ async def webhook_estudiante(request: Request, db: Session = Depends(get_db)):
                 f"👤 <b>{nombre_est}</b> (ID: <code>{telegram_id}</code>)\n"
                 f"📚 Materia: <b>{materia_duda}</b>\n\n"
                 f"💬 {text}\n\n"
-                f"Para responder:\n<code>/responder {telegram_id} tu respuesta aqui</code>")
+                f"Para responder con texto: <code>/responder {telegram_id} tu respuesta</code>\n"
+                f"Para responder con voz: <code>/responder_voz {telegram_id}</code>")
             await send_message(BOT_ESTUDIANTE_TOKEN, chat_id,
                 f"✅ Tu duda sobre <b>{materia_duda}</b> fue enviada a tu profe. Te responderá pronto.")
         else:
