@@ -18,6 +18,7 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 import numpy as np
+from datetime import datetime, timedelta
 
 app = FastAPI(title="ZipGrade System API", version="1.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -256,19 +257,41 @@ async def send_excel(token, chat_id, excel_bytes, filename, caption=""):
 async def send_voice(token, chat_id, file_id, source_token, caption=""):
     try:
         async with httpx.AsyncClient(timeout=60) as client:
-            # Obtener la URL del archivo desde el bot origen
             r = await client.get(f"https://api.telegram.org/bot{source_token}/getFile",
                 params={"file_id": file_id})
             file_path = r.json()["result"]["file_path"]
-            # Descargar el audio
             audio_r = await client.get(f"https://api.telegram.org/file/bot{source_token}/{file_path}")
             audio_bytes = audio_r.content
-            # Enviarlo con el bot destino
             await client.post(f"https://api.telegram.org/bot{token}/sendVoice",
                 data={"chat_id": chat_id, "caption": caption},
                 files={"voice": ("voice.ogg", audio_bytes, "audio/ogg")})
     except Exception as e:
         print(f"Error enviando nota de voz: {e}")
+
+def sesion_activa(db, telegram_id):
+    r = db.query(Resultado).filter(
+        Resultado.nombre_temp == f"__estado__{telegram_id}__sesion_inicio"
+    ).first()
+    if not r or not r.quiz_nombre:
+        return False
+    try:
+        inicio = datetime.fromisoformat(r.quiz_nombre)
+        return datetime.now() < inicio + timedelta(minutes=15)
+    except:
+        return False
+
+def tiempo_restante(db, telegram_id):
+    r = db.query(Resultado).filter(
+        Resultado.nombre_temp == f"__estado__{telegram_id}__sesion_inicio"
+    ).first()
+    if not r or not r.quiz_nombre:
+        return 0
+    try:
+        inicio = datetime.fromisoformat(r.quiz_nombre)
+        restante = (inicio + timedelta(minutes=15)) - datetime.now()
+        return max(0, int(restante.total_seconds() / 60))
+    except:
+        return 0
 
 def get_estado(db, telegram_id, clave):
     r = db.query(Resultado).filter(
@@ -379,7 +402,7 @@ async def webhook_profe(request: Request, db: Session = Depends(get_db)):
                 estudiante_dest = int(paso.replace("responder_voz_", ""))
                 del_estado(db, telegram_id, "paso")
                 await send_voice(BOT_ESTUDIANTE_TOKEN, estudiante_dest, voice_file_id, BOT_PROFE_TOKEN,
-    "🎙️ Nota de voz de tu profe")
+                    "🎙️ Nota de voz de tu profe")
                 await send_message(BOT_PROFE_TOKEN, chat_id, "✅ Nota de voz enviada al estudiante.")
             except Exception as e:
                 await send_message(BOT_PROFE_TOKEN, chat_id,
@@ -702,9 +725,11 @@ async def webhook_estudiante(request: Request, db: Session = Depends(get_db)):
             set_estado(db, telegram_id, "duda_materia", materia)
             set_estado(db, telegram_id, "duda_profe_id", str(profe_tid))
             set_estado(db, telegram_id, "esperando_duda", "si")
+            set_estado(db, telegram_id, "sesion_inicio", datetime.now().isoformat())
             await send_message(BOT_ESTUDIANTE_TOKEN, chat_id,
                 f"📚 Materia: <b>{materia}</b>\n\n"
-                f"✏️ Escribe tu duda o graba una nota de voz 🎙️:")
+                f"✏️ Puedes enviar mensajes de texto y notas de voz 🎙️ libremente durante 15 minutos.\n\n"
+                f"La sesion se cerrara automaticamente.")
         return {"ok": True}
 
     chat_id = message.get("chat", {}).get("id")
@@ -719,28 +744,31 @@ async def webhook_estudiante(request: Request, db: Session = Depends(get_db)):
     estudiante = db.query(Estudiante).filter(Estudiante.telegram_id == telegram_id).first()
 
     # NOTA DE VOZ DEL ESTUDIANTE → reenviar al profe
-    # IMPORTANTE: leer todos los estados ANTES de borrarlos
     if voice:
         esperando = get_estado(db, telegram_id, "esperando_duda")
-        if esperando == "si":
+        if esperando == "si" and sesion_activa(db, telegram_id):
             voice_file_id = voice.get("file_id")
             nombre_est = estudiante.nombre if estudiante else nombre
             materia_duda = get_estado(db, telegram_id, "duda_materia") or "Sin materia"
             profe_id_str = get_estado(db, telegram_id, "duda_profe_id")
             profe_dest = int(profe_id_str) if profe_id_str else PROFE_CHAT_ID
-            # Borrar estados DESPUÉS de leerlos
-            del_estado(db, telegram_id, "esperando_duda")
-            del_estado(db, telegram_id, "duda_materia")
-            del_estado(db, telegram_id, "duda_profe_id")
+            # NO borrar estados — la sesion sigue activa
             await send_message(BOT_PROFE_TOKEN, profe_dest,
-                f"🎙️ <b>Nota de voz de estudiante:</b>\n\n"
-                f"👤 <b>{nombre_est}</b> (ID: <code>{telegram_id}</code>)\n"
-                f"📚 Materia: <b>{materia_duda}</b>\n\n"
+                f"🎙️ <b>Nota de voz de estudiante:</b>\n"
+                f"👤 <b>{nombre_est}</b> | 📚 <b>{materia_duda}</b>\n"
                 f"Para responder con texto: <code>/responder {telegram_id} tu respuesta</code>\n"
                 f"Para responder con voz: <code>/responder_voz {telegram_id}</code>")
             await send_voice(BOT_PROFE_TOKEN, profe_dest, voice_file_id, BOT_ESTUDIANTE_TOKEN)
             await send_message(BOT_ESTUDIANTE_TOKEN, chat_id,
-                f"✅ Tu nota de voz sobre <b>{materia_duda}</b> fue enviada a tu profe.")
+                f"✅ Nota de voz enviada. Puedes seguir enviando mensajes.")
+        elif esperando == "si" and not sesion_activa(db, telegram_id):
+            del_estado(db, telegram_id, "esperando_duda")
+            del_estado(db, telegram_id, "duda_materia")
+            del_estado(db, telegram_id, "duda_profe_id")
+            del_estado(db, telegram_id, "sesion_inicio")
+            await send_message(BOT_ESTUDIANTE_TOKEN, chat_id,
+                "⏰ Tu sesion de 15 minutos ha expirado.\n\n"
+                "Usa /duda para iniciar una nueva sesion con tu profe.")
         else:
             await send_message(BOT_ESTUDIANTE_TOKEN, chat_id,
                 "❌ Primero usa /duda para iniciar una consulta con tu profe.")
@@ -815,24 +843,30 @@ async def webhook_estudiante(request: Request, db: Session = Depends(get_db)):
     elif text and not text.startswith("/"):
         esperando = get_estado(db, telegram_id, "esperando_duda")
 
-        if esperando == "si":
-            # Leer todos los estados ANTES de borrarlos
+        if esperando == "si" and sesion_activa(db, telegram_id):
             nombre_est = estudiante.nombre if estudiante else nombre
             materia_duda = get_estado(db, telegram_id, "duda_materia") or "Sin materia"
             profe_id_str = get_estado(db, telegram_id, "duda_profe_id")
             profe_dest = int(profe_id_str) if profe_id_str else PROFE_CHAT_ID
-            del_estado(db, telegram_id, "esperando_duda")
-            del_estado(db, telegram_id, "duda_materia")
-            del_estado(db, telegram_id, "duda_profe_id")
+            mins = tiempo_restante(db, telegram_id)
+            # NO borrar estados — la sesion sigue activa
             await send_message(BOT_PROFE_TOKEN, profe_dest,
-                f"📩 <b>Duda de estudiante:</b>\n\n"
-                f"👤 <b>{nombre_est}</b> (ID: <code>{telegram_id}</code>)\n"
-                f"📚 Materia: <b>{materia_duda}</b>\n\n"
+                f"📩 <b>Mensaje de estudiante:</b>\n"
+                f"👤 <b>{nombre_est}</b> | 📚 <b>{materia_duda}</b>\n\n"
                 f"💬 {text}\n\n"
                 f"Para responder con texto: <code>/responder {telegram_id} tu respuesta</code>\n"
                 f"Para responder con voz: <code>/responder_voz {telegram_id}</code>")
             await send_message(BOT_ESTUDIANTE_TOKEN, chat_id,
-                f"✅ Tu duda sobre <b>{materia_duda}</b> fue enviada a tu profe. Te responderá pronto.")
+                f"✅ Mensaje enviado. Sesion activa por {mins} min mas.\n"
+                f"Puedes seguir enviando mensajes o notas de voz.")
+        elif esperando == "si" and not sesion_activa(db, telegram_id):
+            del_estado(db, telegram_id, "esperando_duda")
+            del_estado(db, telegram_id, "duda_materia")
+            del_estado(db, telegram_id, "duda_profe_id")
+            del_estado(db, telegram_id, "sesion_inicio")
+            await send_message(BOT_ESTUDIANTE_TOKEN, chat_id,
+                "⏰ Tu sesion de 15 minutos ha expirado.\n\n"
+                "Usa /duda para iniciar una nueva sesion con tu profe.")
         else:
             busqueda = text.strip()
             resultados_materia = db.query(Resultado).filter(
