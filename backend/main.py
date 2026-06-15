@@ -258,12 +258,6 @@ async def send_voice(token, chat_id, file_id, caption=""):
         await client.post(f"https://api.telegram.org/bot{token}/sendVoice",
             json={"chat_id": chat_id, "voice": file_id, "caption": caption})
 
-async def get_file_id(token, file_id_telegram):
-    async with httpx.AsyncClient(timeout=60) as client:
-        r = await client.get(f"https://api.telegram.org/bot{token}/getFile",
-            params={"file_id": file_id_telegram})
-        return r.json()
-
 def get_estado(db, telegram_id, clave):
     r = db.query(Resultado).filter(
         Resultado.nombre_temp == f"__estado__{telegram_id}__{clave}"
@@ -367,14 +361,17 @@ async def webhook_profe(request: Request, db: Session = Depends(get_db)):
     # NOTA DE VOZ DEL PROFE → reenviar al estudiante
     if voice:
         voice_file_id = voice.get("file_id")
-        # El profe debe haber escrito antes /responder_voz ID
         paso = get_estado(db, telegram_id, "paso")
         if paso and paso.startswith("responder_voz_"):
-            estudiante_dest = int(paso.replace("responder_voz_", ""))
-            del_estado(db, telegram_id, "paso")
-            await send_voice(BOT_ESTUDIANTE_TOKEN, estudiante_dest, voice_file_id,
-                "🎙️ Nota de voz de tu profe")
-            await send_message(BOT_PROFE_TOKEN, chat_id, "✅ Nota de voz enviada al estudiante.")
+            try:
+                estudiante_dest = int(paso.replace("responder_voz_", ""))
+                del_estado(db, telegram_id, "paso")
+                await send_voice(BOT_ESTUDIANTE_TOKEN, estudiante_dest, voice_file_id,
+                    "🎙️ Nota de voz de tu profe")
+                await send_message(BOT_PROFE_TOKEN, chat_id, "✅ Nota de voz enviada al estudiante.")
+            except Exception as e:
+                await send_message(BOT_PROFE_TOKEN, chat_id,
+                    f"❌ Error enviando nota de voz: {str(e)}")
         else:
             await send_message(BOT_PROFE_TOKEN, chat_id,
                 "❌ Primero usa <code>/responder_voz ID_ESTUDIANTE</code> y luego envía la nota de voz.")
@@ -710,18 +707,19 @@ async def webhook_estudiante(request: Request, db: Session = Depends(get_db)):
     estudiante = db.query(Estudiante).filter(Estudiante.telegram_id == telegram_id).first()
 
     # NOTA DE VOZ DEL ESTUDIANTE → reenviar al profe
+    # IMPORTANTE: leer todos los estados ANTES de borrarlos
     if voice:
         esperando = get_estado(db, telegram_id, "esperando_duda")
         if esperando == "si":
             voice_file_id = voice.get("file_id")
-            del_estado(db, telegram_id, "esperando_duda")
             nombre_est = estudiante.nombre if estudiante else nombre
             materia_duda = get_estado(db, telegram_id, "duda_materia") or "Sin materia"
             profe_id_str = get_estado(db, telegram_id, "duda_profe_id")
             profe_dest = int(profe_id_str) if profe_id_str else PROFE_CHAT_ID
+            # Borrar estados DESPUÉS de leerlos
+            del_estado(db, telegram_id, "esperando_duda")
             del_estado(db, telegram_id, "duda_materia")
             del_estado(db, telegram_id, "duda_profe_id")
-
             await send_message(BOT_PROFE_TOKEN, profe_dest,
                 f"🎙️ <b>Nota de voz de estudiante:</b>\n\n"
                 f"👤 <b>{nombre_est}</b> (ID: <code>{telegram_id}</code>)\n"
@@ -806,11 +804,12 @@ async def webhook_estudiante(request: Request, db: Session = Depends(get_db)):
         esperando = get_estado(db, telegram_id, "esperando_duda")
 
         if esperando == "si":
-            del_estado(db, telegram_id, "esperando_duda")
+            # Leer todos los estados ANTES de borrarlos
             nombre_est = estudiante.nombre if estudiante else nombre
             materia_duda = get_estado(db, telegram_id, "duda_materia") or "Sin materia"
             profe_id_str = get_estado(db, telegram_id, "duda_profe_id")
             profe_dest = int(profe_id_str) if profe_id_str else PROFE_CHAT_ID
+            del_estado(db, telegram_id, "esperando_duda")
             del_estado(db, telegram_id, "duda_materia")
             del_estado(db, telegram_id, "duda_profe_id")
             await send_message(BOT_PROFE_TOKEN, profe_dest,
