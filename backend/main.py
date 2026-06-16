@@ -1,16 +1,24 @@
-
-from fastapi import FastAPI, Depends, HTTPException, Request
+from fastapi import FastAPI, UploadFile, File, Form, Depends, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 from backend.config import settings
-from backend.models.models import Base, Profe, Estudiante, Curso, Quiz, Resultado, CursoEstudiante, MensajeGrupo
+from backend.models.models import Base, Profe, Estudiante, Curso, Quiz, Resultado, CursoEstudiante
 from backend.services.suscripcion_service import (
     profe_activo, estudiante_activo, activar_profe, activar_estudiante,
     desactivar_profe, desactivar_estudiante
 )
 from backend.services.pdf_service import procesar_pdf_zipgrade
-import uuid, os, httpx
+import uuid, os, httpx, io
+import boto3
+import openpyxl
+from openpyxl.styles import Font, PatternFill, Alignment
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+import numpy as np
+from datetime import datetime, timedelta
 
 app = FastAPI(title="ZipGrade System API", version="1.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -22,10 +30,12 @@ SessionLocal = sessionmaker(bind=engine)
 BOT_PROFE_TOKEN = os.getenv("BOT_PROFE_TOKEN", "")
 BOT_ESTUDIANTE_TOKEN = os.getenv("BOT_ESTUDIANTE_TOKEN", "")
 BASE_URL = os.getenv("RAILWAY_PUBLIC_DOMAIN", "")
-
-profe_estado = {}
-estudiante_grupo_estado = {}
-profe_grupo_estado = {}
+R2_ACCOUNT_ID = os.getenv("R2_ACCOUNT_ID", "")
+R2_ACCESS_KEY = os.getenv("R2_ACCESS_KEY", "")
+R2_SECRET_KEY = os.getenv("R2_SECRET_KEY", "")
+R2_BUCKET_NAME = os.getenv("R2_BUCKET_NAME", "zipgrade-pdfs")
+R2_PUBLIC_URL = os.getenv("R2_PUBLIC_URL", "")
+PROFE_CHAT_ID = 8911705192
 
 def get_db():
     db = SessionLocal()
@@ -34,254 +44,1080 @@ def get_db():
     finally:
         db.close()
 
+def subir_pdf_r2(pdf_bytes: bytes, nombre_archivo: str) -> str:
+    try:
+        client = boto3.client(
+            "s3",
+            endpoint_url=f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com",
+            aws_access_key_id=R2_ACCESS_KEY,
+            aws_secret_access_key=R2_SECRET_KEY,
+            region_name="auto"
+        )
+        client.put_object(
+            Bucket=R2_BUCKET_NAME,
+            Key=nombre_archivo,
+            Body=pdf_bytes,
+            ContentType="application/pdf"
+        )
+        return f"{R2_PUBLIC_URL}/{nombre_archivo}"
+    except Exception as e:
+        print(f"Error subiendo PDF a R2: {e}")
+        return ""
+
+def generar_grafico_estudiante(nombre_est, resultados):
+    if not resultados:
+        return None
+    materias = {}
+    for r in resultados:
+        curso = r.curso_nombre or "Sin curso"
+        quiz = r.quiz_nombre or "Quiz"
+        nota = float(r.nota) if r.nota else 0
+        porcentaje = float(r.porcentaje) if r.porcentaje else 0
+        key = f"{curso}\n{quiz}"
+        materias[key] = {"nota": nota, "porcentaje": porcentaje}
+    etiquetas = list(materias.keys())
+    notas = [materias[k]["nota"] for k in etiquetas]
+    porcentajes = [materias[k]["porcentaje"] for k in etiquetas]
+    x = np.arange(len(etiquetas))
+    ancho = 0.35
+    fig, ax1 = plt.subplots(figsize=(max(10, len(etiquetas) * 1.8), 7))
+    fig.patch.set_facecolor('#F8F9FA')
+    ax1.set_facecolor('#F8F9FA')
+    colores = ['#27AE60' if n >= 3.5 else '#F39C12' if n >= 3.0 else '#E74C3C' for n in notas]
+    bars1 = ax1.bar(x - ancho/2, notas, ancho, color=colores, alpha=0.85, edgecolor='white', linewidth=1.5)
+    ax2 = ax1.twinx()
+    bars2 = ax2.bar(x + ancho/2, porcentajes, ancho, color='#3498DB', alpha=0.6, edgecolor='white', linewidth=1.5)
+    ax1.axhline(y=3.0, color='#E74C3C', linestyle='--', linewidth=1.5, alpha=0.7)
+    for bar, nota in zip(bars1, notas):
+        ax1.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.05,
+                f'{nota:.1f}', ha='center', va='bottom', fontsize=9, fontweight='bold')
+    for bar, pct in zip(bars2, porcentajes):
+        ax2.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.5,
+                f'{pct:.0f}%', ha='center', va='bottom', fontsize=9, color='#2980B9', fontweight='bold')
+    ax1.set_xlabel('Materia / Quiz', fontsize=11, fontweight='bold')
+    ax1.set_ylabel('Nota (sobre 5.0)', fontsize=11, fontweight='bold')
+    ax2.set_ylabel('Porcentaje (%)', fontsize=11, fontweight='bold', color='#2980B9')
+    ax1.set_title(f'Rendimiento academico\n{nombre_est}', fontsize=13, fontweight='bold', pad=15)
+    ax1.set_xticks(x)
+    ax1.set_xticklabels(etiquetas, fontsize=8)
+    ax1.set_ylim(0, 6)
+    ax2.set_ylim(0, 120)
+    verde = mpatches.Patch(color='#27AE60', label='Aprobado (>=3.5)')
+    amarillo = mpatches.Patch(color='#F39C12', label='Aprobado (3.0-3.4)')
+    rojo = mpatches.Patch(color='#E74C3C', label='Reprobado (<3.0)')
+    azul = mpatches.Patch(color='#3498DB', alpha=0.6, label='Porcentaje %')
+    ax1.legend(handles=[verde, amarillo, rojo, azul], loc='upper right', fontsize=8)
+    plt.tight_layout()
+    buf = io.BytesIO()
+    plt.savefig(buf, format='png', dpi=150, bbox_inches='tight')
+    buf.seek(0)
+    plt.close()
+    return buf.getvalue()
+
+def generar_grafico_profe(resultados_todos):
+    if not resultados_todos:
+        return None
+    grupos = {}
+    for r in resultados_todos:
+        curso = r.curso_nombre or "Sin curso"
+        quiz = r.quiz_nombre or "Quiz"
+        nota = float(r.nota) if r.nota else 0
+        key = f"{curso}\n{quiz}"
+        if key not in grupos:
+            grupos[key] = {"aprobados": 0, "reprobados": 0, "total": 0}
+        grupos[key]["total"] += 1
+        if nota >= 3.0:
+            grupos[key]["aprobados"] += 1
+        else:
+            grupos[key]["reprobados"] += 1
+    etiquetas = list(grupos.keys())
+    aprobados = [grupos[k]["aprobados"] for k in etiquetas]
+    reprobados = [grupos[k]["reprobados"] for k in etiquetas]
+    totales = [grupos[k]["total"] for k in etiquetas]
+    pct_reprobados = [round(grupos[k]["reprobados"] / grupos[k]["total"] * 100, 1) for k in etiquetas]
+    x = np.arange(len(etiquetas))
+    ancho = 0.35
+    fig, ax = plt.subplots(figsize=(max(10, len(etiquetas) * 2), 7))
+    fig.patch.set_facecolor('#F8F9FA')
+    ax.set_facecolor('#F8F9FA')
+    bars1 = ax.bar(x - ancho/2, aprobados, ancho, label='Aprobados', color='#27AE60', alpha=0.85, edgecolor='white', linewidth=1.5)
+    bars2 = ax.bar(x + ancho/2, reprobados, ancho, label='Reprobados', color='#E74C3C', alpha=0.85, edgecolor='white', linewidth=1.5)
+    for bar, val in zip(bars1, aprobados):
+        if val > 0:
+            ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.1,
+                    str(val), ha='center', va='bottom', fontsize=10, fontweight='bold', color='#27AE60')
+    for bar, val, pct in zip(bars2, reprobados, pct_reprobados):
+        if val > 0:
+            ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.1,
+                    f'{val}\n({pct}%)', ha='center', va='bottom', fontsize=9, fontweight='bold', color='#C0392B')
+    ax.set_xlabel('Materia / Quiz', fontsize=11, fontweight='bold')
+    ax.set_ylabel('Numero de estudiantes', fontsize=11, fontweight='bold')
+    ax.set_title('Estadisticas del grupo\nAprobados vs Reprobados', fontsize=13, fontweight='bold', pad=15)
+    ax.set_xticks(x)
+    ax.set_xticklabels(etiquetas, fontsize=8)
+    ax.legend(fontsize=10)
+    ax.yaxis.set_major_locator(plt.MaxNLocator(integer=True))
+    plt.tight_layout()
+    buf = io.BytesIO()
+    plt.savefig(buf, format='png', dpi=150, bbox_inches='tight')
+    buf.seek(0)
+    plt.close()
+    return buf.getvalue()
+
+def generar_excel(resultados, titulo):
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Notas"
+    header_font = Font(bold=True, color="FFFFFF")
+    header_fill = PatternFill("solid", fgColor="1F4E79")
+    title_font = Font(bold=True, size=13, color="1F4E79")
+    center = Alignment(horizontal="center", vertical="center")
+    left = Alignment(horizontal="left", vertical="center")
+    ws.merge_cells("A1:D1")
+    ws["A1"] = titulo
+    ws["A1"].font = title_font
+    ws["A1"].alignment = center
+    ws.row_dimensions[1].height = 25
+    encabezados = ["#", "Estudiante", "Nota (sobre 5.0)", "Porcentaje"]
+    anchos = [5, 30, 18, 15]
+    for col, (h, ancho) in enumerate(zip(encabezados, anchos), 1):
+        cell = ws.cell(row=2, column=col, value=h)
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.alignment = center
+        ws.column_dimensions[cell.column_letter].width = ancho
+    ws.row_dimensions[2].height = 20
+    for i, r in enumerate(resultados, 1):
+        nota = float(r.nota) if r.nota else 0
+        porcentaje = float(r.porcentaje) if r.porcentaje else 0
+        fila = i + 2
+        ws.cell(row=fila, column=1, value=i).alignment = center
+        ws.cell(row=fila, column=2, value=r.nombre_temp or "").alignment = left
+        ws.cell(row=fila, column=3, value=f"{nota:.2f} / 5.0").alignment = center
+        ws.cell(row=fila, column=4, value=f"{porcentaje:.1f}%").alignment = center
+        nota_cell = ws.cell(row=fila, column=3)
+        if nota >= 3.5:
+            nota_cell.fill = PatternFill("solid", fgColor="C6EFCE")
+            nota_cell.font = Font(color="276221", bold=True)
+        elif nota >= 3.0:
+            nota_cell.fill = PatternFill("solid", fgColor="FFEB9C")
+            nota_cell.font = Font(color="9C5700", bold=True)
+        else:
+            nota_cell.fill = PatternFill("solid", fgColor="FFC7CE")
+            nota_cell.font = Font(color="9C0006", bold=True)
+        ws.row_dimensions[fila].height = 18
+    total = len(resultados)
+    if total > 0:
+        promedio = sum(float(r.nota) for r in resultados if r.nota) / total
+        aprobados = sum(1 for r in resultados if r.nota and float(r.nota) >= 3.0)
+        fila_prom = total + 4
+        ws.merge_cells(f"A{fila_prom}:D{fila_prom}")
+        ws[f"A{fila_prom}"] = f"Total: {total}  |  Aprobados: {aprobados}  |  Reprobados: {total - aprobados}"
+        ws[f"A{fila_prom}"].font = Font(bold=True, color="1F4E79")
+        ws[f"A{fila_prom+1}"] = "Promedio del grupo:"
+        ws[f"A{fila_prom+1}"].font = Font(bold=True)
+        ws[f"C{fila_prom+1}"] = f"{promedio:.2f} / 5.0"
+        ws[f"C{fila_prom+1}"].font = Font(bold=True, color="1F4E79")
+        ws[f"C{fila_prom+1}"].alignment = Alignment(horizontal="center")
+    buffer = io.BytesIO()
+    wb.save(buffer)
+    buffer.seek(0)
+    return buffer.getvalue()
+
 async def send_message(token, chat_id, text, reply_markup=None):
-    try:
-        payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
-        if reply_markup: payload["reply_markup"] = reply_markup
-        async with httpx.AsyncClient() as client:
-            await client.post(f"https://api.telegram.org/bot{token}/sendMessage", json=payload, timeout=10)
-    except Exception:
-        pass
+    payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+    async with httpx.AsyncClient() as client:
+        await client.post(f"https://api.telegram.org/bot{token}/sendMessage", json=payload)
 
-async def cargar_historial_grupo(db: Session, token: str, chat_id: int, curso_id: str):
-    try:
-        # Conversión segura a UUID para la consulta
-        c_uuid = uuid.UUID(curso_id)
-        mensajes = db.query(MensajeGrupo).filter(MensajeGrupo.curso_id == c_uuid).order_by(MensajeGrupo.fecha_envio.asc()).all()
-        if not mensajes:
-            await send_message(token, chat_id, "📭 <i>Este grupo no tiene mensajes compartidos todavía.</i>")
-            return
-            
-        await send_message(token, chat_id, f"📜 <b>Cargando historial ({len(mensajes)} mensajes)...</b>")
-        for msg in mensajes:
-            data_multimedia = {"text": msg.texto, "file_id": msg.file_id, "caption": msg.caption}
-            es_docente = "[PROFE]" in msg.remitente_nombre
-            nombre_limpio = msg.remitente_nombre.replace("👨‍🏫 [PROFE] ", "").replace("👥 [GRUPO] ", "")
-            await enviar_multimedia_generico(token, chat_id, nombre_limpio, data_multimedia, msg.tipo_mensaje, es_profe=es_docente)
-    except Exception:
-        pass
+async def send_photo(token, chat_id, photo_url, caption=""):
+    async with httpx.AsyncClient() as client:
+        await client.post(f"https://api.telegram.org/bot{token}/sendPhoto",
+            json={"chat_id": chat_id, "photo": photo_url, "caption": caption})
 
-async def alertar_conexion_profe(db: Session, curso_id: str, nombre_prof: str, curso_nombre: str, curso_grado: str):
-    try:
-        c_uuid = uuid.UUID(curso_id)
-        inscripciones = db.query(CursoEstudiante).filter(CursoEstudiante.curso_id == c_uuid).all()
-        texto_alerta = (
-            f"👨‍🏫 <b>Notificación Escolar:</b>\n\n"
-            f"El profesor <b>{nombre_prof}</b> se conectó al grupo de <b>{curso_nombre} {curso_grado}</b>.\n\n"
-            f"💡 Usa /grupos para ingresar a la asignatura."
-        )
-        for ins in inscripciones:
-            est = db.query(Estudiante).filter(Estudiante.id == ins.estudiante_id).first()
-            if est and est.activo:
-                await send_message(BOT_ESTUDIANTE_TOKEN, est.telegram_id, texto_alerta)
-    except Exception:
-        pass
+async def send_photo_bytes(token, chat_id, photo_bytes, caption=""):
+    async with httpx.AsyncClient(timeout=60) as client:
+        await client.post(f"https://api.telegram.org/bot{token}/sendPhoto",
+            data={"chat_id": chat_id, "caption": caption},
+            files={"photo": ("grafico.png", photo_bytes, "image/png")})
 
-async def registrar_y_transmitir_en_grupo(db: Session, curso_id: str, remitente_telegram_id: int, remitente_nombre: str, data: dict, tipo_mensaje: str, es_profe: bool):
-    try:
-        c_uuid = uuid.UUID(curso_id)
-        etiqueta = f"👨‍🏫 [PROFE] {remitente_nombre}" if es_profe else f"👥 [GRUPO] {remitente_nombre}"
-        nuevo_msg = MensajeGrupo(
-            id=uuid.uuid4(),
-            curso_id=c_uuid,
-            remitente_nombre=etiqueta,
-            tipo_mensaje=tipo_mensaje,
-            texto=data.get("text"),
-            file_id=data.get("file_id"),
-            caption=data.get("caption")
-        )
-        db.add(nuevo_msg)
-        db.commit()
+async def send_document_url(token, chat_id, doc_url, caption=""):
+    async with httpx.AsyncClient() as client:
+        await client.post(f"https://api.telegram.org/bot{token}/sendDocument",
+            json={"chat_id": chat_id, "document": doc_url, "caption": caption})
 
-        for est_tg_id, estado in estudiante_grupo_estado.items():
-            if estado.get("curso_id") == str(curso_id) and est_tg_id != remitente_telegram_id:
-                await enviar_multimedia_generico(BOT_ESTUDIANTE_TOKEN, est_tg_id, remitente_nombre, data, tipo_mensaje, es_profe)
-                
-        for prof_tg_id, estado in profe_grupo_estado.items():
-            if estado.get("curso_id") == str(curso_id) and prof_tg_id != remitente_telegram_id:
-                await enviar_multimedia_generico(BOT_PROFE_TOKEN, prof_tg_id, remitente_nombre, data, tipo_mensaje, es_profe)
-    except Exception:
-        pass
+async def send_excel(token, chat_id, excel_bytes, filename, caption=""):
+    async with httpx.AsyncClient(timeout=60) as client:
+        await client.post(f"https://api.telegram.org/bot{token}/sendDocument",
+            data={"chat_id": chat_id, "caption": caption},
+            files={"document": (filename, excel_bytes,
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")})
 
-async def enviar_multimedia_generico(token: str, chat_id: int, remitente_nombre: str, data: dict, tipo_mensaje: str, es_profe: bool):
+async def send_voice(token, chat_id, file_id, source_token, caption=""):
     try:
-        prefix = f"👨‍🏫 <b>[PROFE] {remitente_nombre}:</b>" if es_profe else f"👥 <b>[GRUPO] {remitente_nombre}:</b>"
-        async with httpx.AsyncClient() as client:
-            if tipo_mensaje == "text":
-                texto_final = f"{prefix}\n{data['text']}"
-                await client.post(f"https://api.telegram.org/bot{token}/sendMessage", 
-                                  json={"chat_id": chat_id, "text": texto_final, "parse_mode": "HTML"}, timeout=10)
-            elif tipo_mensaje == "document":
-                caption = f"{prefix} compartió un archivo"
-                if data.get("caption"): caption += f"\n{data['caption']}"
-                await client.post(f"https://api.telegram.org/bot{token}/sendDocument", 
-                                  json={"chat_id": chat_id, "document": data["file_id"], "caption": caption, "parse_mode": "HTML"}, timeout=10)
-            elif tipo_mensaje == "photo":
-                caption = f"{prefix} envió una imagen"
-                if data.get("caption"): caption += f"\n{data['caption']}"
-                await client.post(f"https://api.telegram.org/bot{token}/sendPhoto", 
-                                  json={"chat_id": chat_id, "photo": data["file_id"], "caption": caption, "parse_mode": "HTML"}, timeout=10)
-            elif tipo_mensaje == "voice":
-                await client.post(f"https://api.telegram.org/bot{token}/sendVoice", 
-                                  json={"chat_id": chat_id, "voice": data["file_id"], "caption": prefix, "parse_mode": "HTML"}, timeout=10)
-            elif tipo_mensaje == "video":
-                caption = f"{prefix} envió un video"
-                if data.get("caption"): caption += f"\n{data['caption']}"
-                await client.post(f"https://api.telegram.org/bot{token}/sendVideo", 
-                                  json={"chat_id": chat_id, "video": data["file_id"], "caption": caption, "parse_mode": "HTML"}, timeout=10)
-    except Exception:
-        pass
+        async with httpx.AsyncClient(timeout=60) as client:
+            r = await client.get(f"https://api.telegram.org/bot{source_token}/getFile",
+                params={"file_id": file_id})
+            file_path = r.json()["result"]["file_path"]
+            audio_r = await client.get(f"https://api.telegram.org/file/bot{source_token}/{file_path}")
+            audio_bytes = audio_r.content
+            await client.post(f"https://api.telegram.org/bot{token}/sendVoice",
+                data={"chat_id": chat_id, "caption": caption},
+                files={"voice": ("voice.ogg", audio_bytes, "audio/ogg")})
+    except Exception as e:
+        print(f"Error enviando nota de voz: {e}")
+
+async def reenviar_archivo(token_destino, chat_id_destino, file_id, token_origen, file_name="archivo", caption="", tipo="document"):
+    """Descarga un archivo del bot origen y lo reenvía con el bot destino"""
+    try:
+        async with httpx.AsyncClient(timeout=120) as client:
+            r = await client.get(f"https://api.telegram.org/bot{token_origen}/getFile",
+                params={"file_id": file_id})
+            file_path = r.json()["result"]["file_path"]
+            file_r = await client.get(f"https://api.telegram.org/file/bot{token_origen}/{file_path}")
+            file_bytes = file_r.content
+            if tipo == "photo":
+                await client.post(f"https://api.telegram.org/bot{token_destino}/sendPhoto",
+                    data={"chat_id": chat_id_destino, "caption": caption},
+                    files={"photo": (file_name, file_bytes, "image/jpeg")})
+            elif tipo == "video":
+                await client.post(f"https://api.telegram.org/bot{token_destino}/sendVideo",
+                    data={"chat_id": chat_id_destino, "caption": caption},
+                    files={"video": (file_name, file_bytes, "video/mp4")})
+            else:
+                await client.post(f"https://api.telegram.org/bot{token_destino}/sendDocument",
+                    data={"chat_id": chat_id_destino, "caption": caption},
+                    files={"document": (file_name, file_bytes, "application/octet-stream")})
+    except Exception as e:
+        print(f"Error reenviando archivo: {e}")
+
+def sesion_activa(db, telegram_id):
+    r = db.query(Resultado).filter(
+        Resultado.nombre_temp == f"__estado__{telegram_id}__sesion_inicio"
+    ).first()
+    if not r or not r.quiz_nombre:
+        return False
+    try:
+        inicio = datetime.fromisoformat(r.quiz_nombre)
+        return datetime.now() < inicio + timedelta(minutes=15)
+    except:
+        return False
+
+def tiempo_restante(db, telegram_id):
+    r = db.query(Resultado).filter(
+        Resultado.nombre_temp == f"__estado__{telegram_id}__sesion_inicio"
+    ).first()
+    if not r or not r.quiz_nombre:
+        return 0
+    try:
+        inicio = datetime.fromisoformat(r.quiz_nombre)
+        restante = (inicio + timedelta(minutes=15)) - datetime.now()
+        return max(0, int(restante.total_seconds() / 60))
+    except:
+        return 0
+
+def get_estado(db, telegram_id, clave):
+    r = db.query(Resultado).filter(
+        Resultado.nombre_temp == f"__estado__{telegram_id}__{clave}"
+    ).first()
+    return r.quiz_nombre if r else None
+
+def set_estado(db, telegram_id, clave, valor):
+    r = db.query(Resultado).filter(
+        Resultado.nombre_temp == f"__estado__{telegram_id}__{clave}"
+    ).first()
+    if r:
+        r.quiz_nombre = valor
+    else:
+        db.add(Resultado(id=uuid.uuid4(),
+            nombre_temp=f"__estado__{telegram_id}__{clave}",
+            quiz_nombre=valor, confirmado=False))
+    db.commit()
+
+def del_estado(db, telegram_id, clave):
+    db.query(Resultado).filter(
+        Resultado.nombre_temp == f"__estado__{telegram_id}__{clave}"
+    ).delete(synchronize_session=False)
+    db.commit()
 
 @app.on_event("startup")
 async def set_webhooks():
     if BOT_PROFE_TOKEN and BASE_URL:
         async with httpx.AsyncClient() as client:
-            await client.get(f"https://api.telegram.org/bot{BOT_PROFE_TOKEN}/setWebhook", params={"url": f"https://{BASE_URL}/webhook/profe"})
-            await client.get(f"https://api.telegram.org/bot{BOT_ESTUDIANTE_TOKEN}/setWebhook", params={"url": f"https://{BASE_URL}/webhook/estudiante"})
+            await client.get(f"https://api.telegram.org/bot{BOT_PROFE_TOKEN}/setWebhook",
+                params={"url": f"https://{BASE_URL}/webhook/profe"})
+            await client.get(f"https://api.telegram.org/bot{BOT_ESTUDIANTE_TOKEN}/setWebhook",
+                params={"url": f"https://{BASE_URL}/webhook/estudiante"})
 
 @app.post("/webhook/profe")
 async def webhook_profe(request: Request, db: Session = Depends(get_db)):
-    try: data = await request.json()
-    except Exception: return {"ok": True}
-
+    data = await request.json()
     callback = data.get("callback_query", {})
+    message = data.get("message", {})
+
     if callback:
         chat_id = callback.get("from", {}).get("id")
         telegram_id = chat_id
-        nombre_prof = callback.get("from", {}).get("first_name", "Profe")
         cb_data = callback.get("data", "")
-        
-        if cb_data.startswith("profe_grupo_"):
-            curso_id = cb_data.replace("profe_grupo_", "")
-            c_uuid = uuid.UUID(curso_id)
-            curso = db.query(Curso).filter(Curso.id == c_uuid).first()
-            if curso:
-                profe_grupo_estado[telegram_id] = {"curso_id": str(curso_id), "curso_nombre": curso.nombre, "curso_grado": curso.grado}
-                await send_message(BOT_PROFE_TOKEN, chat_id, f"📥 <b>Inmerso en: {curso.nombre} {curso.grado}</b>\n\n🚪 Para salir usa: /salir")
-                await cargar_historial_grupo(db, BOT_PROFE_TOKEN, chat_id, str(curso_id))
-                await alertar_conexion_profe(db, str(curso_id), nombre_prof, curso.nombre, curso.grado)
-            return {"ok": True}
-            
-        elif cb_data.startswith("curso_"):
-            curso_id = cb_data.replace("curso_", "")
-            c_uuid = uuid.UUID(curso_id)
-            curso = db.query(Curso).filter(Curso.id == c_uuid).first()
-            if curso:
-                profe_estado[telegram_id] = {"curso_id": str(curso_id), "curso_nombre": curso.nombre}
-                await send_message(BOT_PROFE_TOKEN, chat_id, f"📚 Curso seleccionado. Envía el PDF.")
-            return {"ok": True}
 
-    message = data.get("message", {})
+        if cb_data.startswith("curso_"):
+            curso_id = cb_data.replace("curso_", "")
+            curso = db.query(Curso).filter(Curso.id == curso_id).first()
+            if curso:
+                set_estado(db, telegram_id, "curso_seleccionado", f"{curso_id}|{curso.nombre}")
+                set_estado(db, telegram_id, "paso", "esperando_nombre_quiz")
+                await send_message(BOT_PROFE_TOKEN, chat_id,
+                    f"📚 Curso: <b>{curso.nombre} - {curso.grado}</b>\n\n✏️ Escribe el nombre del quiz:\nEjemplo: <b>Quiz 1 Primer Periodo</b>")
+
+        elif cb_data.startswith("enviar_curso_"):
+            curso_id = cb_data.replace("enviar_curso_", "")
+            curso = db.query(Curso).filter(Curso.id == curso_id).first()
+            if curso:
+                set_estado(db, telegram_id, "enviar_archivo_curso", f"{curso_id}|{curso.nombre}")
+                set_estado(db, telegram_id, "paso", "esperando_archivo_para_curso")
+                await send_message(BOT_PROFE_TOKEN, chat_id,
+                    f"📤 Curso: <b>{curso.nombre} - {curso.grado}</b>\n\n"
+                    f"Ahora envía el archivo, imagen o video que quieres compartir con todos los estudiantes.")
+
+        elif cb_data.startswith("excel_quiz_"):
+            partes = cb_data.replace("excel_quiz_", "").split("|", 1)
+            curso_buscar = partes[0]
+            quiz_buscar = partes[1] if len(partes) > 1 else ""
+            resultados = db.query(Resultado).filter(
+                Resultado.curso_nombre.ilike(f"%{curso_buscar}%"),
+                Resultado.quiz_nombre.ilike(f"%{quiz_buscar}%"),
+                Resultado.confirmado == True
+            ).all()
+            if not resultados:
+                await send_message(BOT_PROFE_TOKEN, chat_id, f"❌ No hay resultados para {quiz_buscar}.")
+            else:
+                titulo = f"Notas - {curso_buscar} - {quiz_buscar}"
+                excel_bytes = generar_excel(resultados, titulo)
+                filename = f"notas_{curso_buscar}_{quiz_buscar}.xlsx".replace(" ", "_")
+                await send_excel(BOT_PROFE_TOKEN, chat_id, excel_bytes, filename,
+                    f"📊 {titulo} — {len(resultados)} estudiantes")
+
+        elif cb_data.startswith("excel_todos_"):
+            curso_buscar = cb_data.replace("excel_todos_", "")
+            resultados = db.query(Resultado).filter(
+                Resultado.curso_nombre.ilike(f"%{curso_buscar}%"),
+                Resultado.confirmado == True
+            ).all()
+            if not resultados:
+                await send_message(BOT_PROFE_TOKEN, chat_id, f"❌ No hay resultados para {curso_buscar}.")
+            else:
+                titulo = f"Todas las notas - {curso_buscar}"
+                excel_bytes = generar_excel(resultados, titulo)
+                filename = f"notas_{curso_buscar}_todos.xlsx".replace(" ", "_")
+                await send_excel(BOT_PROFE_TOKEN, chat_id, excel_bytes, filename,
+                    f"📊 {titulo} — {len(resultados)} registros")
+
+        return {"ok": True}
+
     chat_id = message.get("chat", {}).get("id")
     text = message.get("text", "")
     telegram_id = message.get("from", {}).get("id")
     nombre = message.get("from", {}).get("first_name", "Profe")
-    
-    if not chat_id: return {"ok": True}
+    document = message.get("document", {})
+    voice = message.get("voice", {})
+    photo = message.get("photo", [])
+    video = message.get("video", {})
+
+    if not chat_id:
+        return {"ok": True}
+
     profe = db.query(Profe).filter(Profe.telegram_id == telegram_id).first()
 
+    # NOTA DE VOZ DEL PROFE → reenviar al estudiante
+    if voice:
+        voice_file_id = voice.get("file_id")
+        paso = get_estado(db, telegram_id, "paso")
+        if paso and paso.startswith("responder_voz_"):
+            try:
+                estudiante_dest = int(paso.replace("responder_voz_", ""))
+                del_estado(db, telegram_id, "paso")
+                await send_voice(BOT_ESTUDIANTE_TOKEN, estudiante_dest, voice_file_id, BOT_PROFE_TOKEN,
+                    "🎙️ Nota de voz de tu profe")
+                await send_message(BOT_PROFE_TOKEN, chat_id, "✅ Nota de voz enviada al estudiante.")
+            except Exception as e:
+                await send_message(BOT_PROFE_TOKEN, chat_id, f"❌ Error: {str(e)}")
+        else:
+            await send_message(BOT_PROFE_TOKEN, chat_id,
+                "❌ Primero usa <code>/responder_voz ID_ESTUDIANTE</code> y luego envía la nota de voz.")
+        return {"ok": True}
+
+    # ARCHIVO/IMAGEN/VIDEO DEL PROFE → enviar a curso o estudiante individual
+    archivo_recibido = None
+    archivo_tipo = None
+    archivo_nombre = "archivo"
+
+    if photo:
+        archivo_recibido = photo[-1].get("file_id")
+        archivo_tipo = "photo"
+        archivo_nombre = "imagen.jpg"
+    elif video:
+        archivo_recibido = video.get("file_id")
+        archivo_tipo = "video"
+        archivo_nombre = video.get("file_name", "video.mp4")
+    elif document and not message.get("text", ""):
+        archivo_recibido = document.get("file_id")
+        archivo_tipo = "document"
+        archivo_nombre = document.get("file_name", "archivo")
+
+    if archivo_recibido:
+        paso = get_estado(db, telegram_id, "paso")
+
+        # Archivo para enviar a todo un curso
+        if paso == "esperando_archivo_para_curso":
+            curso_info = get_estado(db, telegram_id, "enviar_archivo_curso")
+            if curso_info:
+                curso_id, curso_nombre = curso_info.split("|", 1)
+                del_estado(db, telegram_id, "paso")
+                del_estado(db, telegram_id, "enviar_archivo_curso")
+                inscripciones = db.query(CursoEstudiante).filter(CursoEstudiante.curso_id == curso_id).all()
+                if not inscripciones:
+                    await send_message(BOT_PROFE_TOKEN, chat_id,
+                        f"⚠️ No hay estudiantes inscritos en <b>{curso_nombre}</b>.")
+                else:
+                    await send_message(BOT_PROFE_TOKEN, chat_id, f"⏳ Enviando a {len(inscripciones)} estudiantes...")
+                    enviados = 0
+                    for ins in inscripciones:
+                        est = db.query(Estudiante).filter(Estudiante.id == ins.estudiante_id).first()
+                        if est:
+                            try:
+                                await reenviar_archivo(BOT_ESTUDIANTE_TOKEN, est.telegram_id,
+                                    archivo_recibido, BOT_PROFE_TOKEN, archivo_nombre,
+                                    f"📎 Archivo de tu profe — {curso_nombre}", archivo_tipo)
+                                enviados += 1
+                            except:
+                                pass
+                    await send_message(BOT_PROFE_TOKEN, chat_id,
+                        f"✅ Archivo enviado a <b>{enviados} estudiantes</b> del curso <b>{curso_nombre}</b>.")
+            return {"ok": True}
+
+        # Archivo para enviar a estudiante individual
+        elif paso and paso.startswith("enviar_archivo_estudiante_"):
+            estudiante_dest = int(paso.replace("enviar_archivo_estudiante_", ""))
+            del_estado(db, telegram_id, "paso")
+            try:
+                await reenviar_archivo(BOT_ESTUDIANTE_TOKEN, estudiante_dest,
+                    archivo_recibido, BOT_PROFE_TOKEN, archivo_nombre,
+                    "📎 Archivo de tu profe", archivo_tipo)
+                await send_message(BOT_PROFE_TOKEN, chat_id, "✅ Archivo enviado al estudiante.")
+            except Exception as e:
+                await send_message(BOT_PROFE_TOKEN, chat_id, f"❌ Error enviando archivo: {str(e)}")
+            return {"ok": True}
+
+        # Si es PDF de ZipGrade (flujo normal)
+        elif archivo_tipo == "document" and archivo_nombre.endswith(".pdf"):
+            paso_actual = get_estado(db, telegram_id, "paso")
+            curso_info = get_estado(db, telegram_id, "curso_seleccionado")
+            quiz_nombre_estado = get_estado(db, telegram_id, "quiz_nombre")
+            resultados_pendientes = db.query(Resultado).filter(
+                Resultado.nombre_temp.like("PAG%"),
+                Resultado.confirmado == False,
+                Resultado.profe_telegram_id == telegram_id
+            ).all()
+
+            async with httpx.AsyncClient(timeout=60) as client:
+                r = await client.get(f"https://api.telegram.org/bot{BOT_PROFE_TOKEN}/getFile",
+                    params={"file_id": archivo_recibido})
+                file_path = r.json()["result"]["file_path"]
+                file_r = await client.get(f"https://api.telegram.org/file/bot{BOT_PROFE_TOKEN}/{file_path}")
+                file_bytes = file_r.content
+
+            if resultados_pendientes and paso_actual == "esperando_pdf_quiz":
+                await send_message(BOT_PROFE_TOKEN, chat_id, "📄 PDF del quiz recibido. Subiendo...")
+                nombre_archivo = f"quizzes/{uuid.uuid4()}.pdf"
+                quiz_pdf_url = subir_pdf_r2(file_bytes, nombre_archivo)
+                if quiz_pdf_url:
+                    for r in resultados_pendientes:
+                        r.quiz_pdf_url = quiz_pdf_url
+                    db.commit()
+                    set_estado(db, telegram_id, "paso", "esperando_nombres")
+                    await send_message(BOT_PROFE_TOKEN, chat_id,
+                        "✅ PDF del quiz guardado.\n\nAhora pega la lista de nombres:\nPAG1: Nombre Apellido\nPAG2: Nombre Apellido...")
+                else:
+                    await send_message(BOT_PROFE_TOKEN, chat_id, "❌ Error subiendo el PDF.")
+            else:
+                if not curso_info:
+                    await send_message(BOT_PROFE_TOKEN, chat_id, "❌ Primero selecciona un curso con /subirquiz")
+                    return {"ok": True}
+                curso_id, curso_nombre = curso_info.split("|", 1)
+                qnombre = quiz_nombre_estado or "Quiz"
+                await send_message(BOT_PROFE_TOKEN, chat_id,
+                    f"📎 PDF de ZipGrade recibido.\n📚 Curso: <b>{curso_nombre}</b>\n📝 Quiz: <b>{qnombre}</b>\n\n⏳ Procesando...")
+                try:
+                    resultados_lista = await procesar_pdf_zipgrade(file_bytes)
+                    total = len(resultados_lista)
+                    db.query(Resultado).filter(
+                        Resultado.nombre_temp.like("PAG%"),
+                        Resultado.confirmado == False,
+                        Resultado.profe_telegram_id == telegram_id
+                    ).delete(synchronize_session=False)
+                    db.commit()
+                    for r in resultados_lista:
+                        nuevo_r = Resultado(
+                            id=uuid.uuid4(),
+                            nombre_temp=r["nombre"],
+                            nota=r["nota"],
+                            puntos=r["puntos"],
+                            posibles=r["posibles"],
+                            porcentaje=r["porcentaje"],
+                            pagina=r.get("pagina", 0),
+                            imagen_url=r.get("imagen_url", ""),
+                            curso_nombre=curso_nombre,
+                            quiz_nombre=qnombre,
+                            profe_telegram_id=telegram_id,
+                            confirmado=False
+                        )
+                        db.add(nuevo_r)
+                    db.commit()
+                    set_estado(db, telegram_id, "paso", "esperando_pdf_quiz")
+                    resumen = "\n".join([f"• <b>{r['nombre']}</b>: {r['nota']}/5.0 ({r['porcentaje']}%)" for r in resultados_lista])
+                    await send_message(BOT_PROFE_TOKEN, chat_id,
+                        f"✅ PDF procesado: <b>{total} estudiantes</b>\n\n{resumen}\n\n"
+                        f"📄 Ahora envíame el PDF del quiz (las preguntas).")
+                except Exception as e:
+                    await send_message(BOT_PROFE_TOKEN, chat_id, f"❌ Error procesando PDF: {str(e)}")
+            return {"ok": True}
+
+        else:
+            # Archivo recibido sin contexto — preguntar a dónde enviarlo
+            cursos = db.query(Curso).filter(Curso.profe_id == profe.id).all() if profe else []
+            if cursos:
+                set_estado(db, telegram_id, "archivo_pendiente_id", archivo_recibido)
+                set_estado(db, telegram_id, "archivo_pendiente_tipo", archivo_tipo)
+                set_estado(db, telegram_id, "archivo_pendiente_nombre", archivo_nombre)
+                set_estado(db, telegram_id, "paso", "esperando_archivo_para_curso")
+                botones = {"inline_keyboard": [[{
+                    "text": f"📚 {c.nombre} - {c.grado}",
+                    "callback_data": f"enviar_curso_{c.id}"
+                }] for c in cursos]}
+                await send_message(BOT_PROFE_TOKEN, chat_id,
+                    "📤 ¿A qué curso quieres enviar este archivo?",
+                    reply_markup=botones)
+            else:
+                await send_message(BOT_PROFE_TOKEN, chat_id,
+                    "❌ No tienes cursos creados. Usa /nuevocurso primero.")
+            return {"ok": True}
+
     if text == "/start":
-        if profe and profe.activo:
-            await send_message(BOT_PROFE_TOKEN, chat_id, "✅ Panel del Profesor Activo.\n\n/micursos - Ver cursos\n/nuevocurso - Crear curso\n/subirquiz - Evaluar con ZipGrade\n/grupos - Entrar a un Aula Virtual\n/salir - Salir del aula")
-        return {"ok": True}
+        if not profe:
+            nuevo = Profe(id=uuid.uuid4(), telegram_id=telegram_id, nombre=nombre, email="", activo=False)
+            db.add(nuevo)
+            db.commit()
+            await send_message(BOT_PROFE_TOKEN, chat_id,
+                f"👋 Hola <b>{nombre}</b>!\n\nTu cuenta fue creada. Contacta al administrador para activar tu suscripcion.")
+        else:
+            if profe.activo:
+                await send_message(BOT_PROFE_TOKEN, chat_id,
+                    f"✅ Hola <b>{profe.nombre}</b>!\n\n📋 Comandos:\n"
+                    f"/micursos - Ver tus cursos\n"
+                    f"/nuevocurso - Crear un curso\n"
+                    f"/subirquiz - Subir quiz\n"
+                    f"/excel - Generar Excel de notas\n"
+                    f"/estadisticas - Ver grafico del grupo\n"
+                    f"/enviar - Enviar archivo a un curso\n"
+                    f"/estado - Ver suscripcion\n\n"
+                    f"💬 Para responder a un estudiante:\n"
+                    f"• Texto: <code>/responder ID mensaje</code>\n"
+                    f"• Voz: <code>/responder_voz ID</code> y luego graba\n"
+                    f"• Archivo: <code>/enviar_a ID</code> y luego envía el archivo")
+            else:
+                await send_message(BOT_PROFE_TOKEN, chat_id, "❌ Tu suscripcion no esta activa.")
 
-    if text == "/salir":
-        if telegram_id in profe_grupo_estado:
-            del profe_grupo_estado[telegram_id]
-            await send_message(BOT_PROFE_TOKEN, chat_id, "🚪 Saliste del grupo. Volviste al menú principal.")
-        return {"ok": True}
+    elif text == "/estado":
+        if profe:
+            estado = "✅ Activa" if profe.activo else "❌ Inactiva"
+            await send_message(BOT_PROFE_TOKEN, chat_id, f"📊 Tu suscripcion: {estado}")
 
-    if text == "/grupos":
-        if not profe or not profe.activo: return {"ok": True}
+    elif text == "/micursos":
+        if not profe or not profe.activo:
+            await send_message(BOT_PROFE_TOKEN, chat_id, "❌ Necesitas suscripcion activa.")
+            return {"ok": True}
         cursos = db.query(Curso).filter(Curso.profe_id == profe.id).all()
-        if cursos:
-            botones = [[{"text": f"👥 Aula de {c.nombre} {c.grado}", "callback_data": f"profe_grupo_{c.id}"}] for c in cursos]
-            await send_message(BOT_PROFE_TOKEN, chat_id, "🗂️ Selecciona el Aula Virtual:", reply_markup={"inline_keyboard": botones})
-        return {"ok": True}
+        if not cursos:
+            await send_message(BOT_PROFE_TOKEN, chat_id, "No tienes cursos. Usa /nuevocurso para crear uno.")
+        else:
+            lista = "\n".join([f"📚 <b>{c.nombre}</b> - {c.grado}" for c in cursos])
+            await send_message(BOT_PROFE_TOKEN, chat_id, f"Tus cursos:\n\n{lista}")
 
-    if telegram_id in profe_grupo_estado:
-        c_id = profe_grupo_estado[telegram_id]["curso_id"]
-        if text: await registrar_y_transmitir_en_grupo(db, c_id, telegram_id, nombre, {"text": text}, "text", es_profe=True)
-        elif message.get("document"): await registrar_y_transmitir_en_grupo(db, c_id, telegram_id, nombre, {"file_id": message["document"]["file_id"], "caption": message.get("caption", "")}, "document", es_profe=True)
-        elif message.get("photo"): await registrar_y_transmitir_en_grupo(db, c_id, telegram_id, nombre, {"file_id": message["photo"][-1]["file_id"], "caption": message.get("caption", "")}, "photo", es_profe=True)
-        elif message.get("voice"): await registrar_y_transmitir_en_grupo(db, c_id, telegram_id, nombre, {"file_id": message["voice"]["file_id"]}, "voice", es_profe=True)
-        elif message.get("video"): await registrar_y_transmitir_en_grupo(db, c_id, telegram_id, nombre, {"file_id": message["video"]["file_id"], "caption": message.get("caption", "")}, "video", es_profe=True)
-        return {"ok": True}
+    elif text == "/nuevocurso":
+        if not profe or not profe.activo:
+            await send_message(BOT_PROFE_TOKEN, chat_id, "❌ Necesitas suscripcion activa.")
+            return {"ok": True}
+        set_estado(db, telegram_id, "paso", "esperando_nombre_curso")
+        await send_message(BOT_PROFE_TOKEN, chat_id,
+            "✏️ Escribe el nombre y grado del curso:\nEjemplo: <b>Matematicas 9B</b>")
+
+    elif text == "/subirquiz":
+        if not profe or not profe.activo:
+            await send_message(BOT_PROFE_TOKEN, chat_id, "❌ Necesitas suscripcion activa.")
+            return {"ok": True}
+        cursos = db.query(Curso).filter(Curso.profe_id == profe.id).all()
+        if not cursos:
+            await send_message(BOT_PROFE_TOKEN, chat_id, "Primero crea un curso con /nuevocurso")
+        else:
+            botones = {"inline_keyboard": [[{"text": f"📚 {c.nombre} - {c.grado}", "callback_data": f"curso_{c.id}"}] for c in cursos]}
+            await send_message(BOT_PROFE_TOKEN, chat_id, "¿A qué curso pertenece este quiz?", reply_markup=botones)
+
+    elif text == "/enviar":
+        if not profe or not profe.activo:
+            await send_message(BOT_PROFE_TOKEN, chat_id, "❌ Necesitas suscripcion activa.")
+            return {"ok": True}
+        cursos = db.query(Curso).filter(Curso.profe_id == profe.id).all()
+        if not cursos:
+            await send_message(BOT_PROFE_TOKEN, chat_id, "No tienes cursos. Usa /nuevocurso para crear uno.")
+        else:
+            botones = {"inline_keyboard": [[{
+                "text": f"📚 {c.nombre} - {c.grado}",
+                "callback_data": f"enviar_curso_{c.id}"
+            }] for c in cursos]}
+            await send_message(BOT_PROFE_TOKEN, chat_id,
+                "📤 ¿A qué curso quieres enviar el archivo?\n\n"
+                "Después de seleccionar el curso, envía el archivo, imagen o video.",
+                reply_markup=botones)
+
+    elif text and text.startswith("/enviar_a"):
+        partes = text.split(" ", 1)
+        if len(partes) >= 2:
+            try:
+                estudiante_id = int(partes[1].strip())
+                set_estado(db, telegram_id, "paso", f"enviar_archivo_estudiante_{estudiante_id}")
+                await send_message(BOT_PROFE_TOKEN, chat_id,
+                    f"📤 Listo. Ahora envía el archivo, imagen o video para el estudiante <code>{estudiante_id}</code>.")
+            except:
+                await send_message(BOT_PROFE_TOKEN, chat_id,
+                    "❌ Formato incorrecto.\nUsa: <code>/enviar_a ID_ESTUDIANTE</code>")
+        else:
+            await send_message(BOT_PROFE_TOKEN, chat_id,
+                "❌ Formato incorrecto.\nUsa: <code>/enviar_a ID_ESTUDIANTE</code>")
+
+    elif text == "/estadisticas":
+        if not profe or not profe.activo:
+            await send_message(BOT_PROFE_TOKEN, chat_id, "❌ Necesitas suscripcion activa.")
+            return {"ok": True}
+        resultados = db.query(Resultado).filter(
+            Resultado.confirmado == True,
+            Resultado.curso_nombre != None,
+            Resultado.profe_telegram_id == telegram_id
+        ).all()
+        if not resultados:
+            await send_message(BOT_PROFE_TOKEN, chat_id, "❌ No hay resultados guardados aun.")
+        else:
+            await send_message(BOT_PROFE_TOKEN, chat_id, "⏳ Generando grafico...")
+            grafico = generar_grafico_profe(resultados)
+            if grafico:
+                await send_photo_bytes(BOT_PROFE_TOKEN, chat_id, grafico,
+                    "📊 Estadisticas del grupo — Aprobados vs Reprobados")
+            else:
+                await send_message(BOT_PROFE_TOKEN, chat_id, "❌ Error generando el grafico.")
+
+    elif text == "/excel" or (text and text.lower().startswith("excel")):
+        if not profe or not profe.activo:
+            await send_message(BOT_PROFE_TOKEN, chat_id, "❌ Necesitas suscripcion activa.")
+            return {"ok": True}
+        cursos_con_datos = db.query(Resultado.curso_nombre).filter(
+            Resultado.confirmado == True,
+            Resultado.curso_nombre != None,
+            Resultado.profe_telegram_id == telegram_id
+        ).distinct().all()
+        if not cursos_con_datos:
+            await send_message(BOT_PROFE_TOKEN, chat_id, "❌ No hay resultados guardados aun.")
+        else:
+            set_estado(db, telegram_id, "paso", "esperando_materia_excel")
+            lista = "\n".join([f"• <b>{c[0]}</b>" for c in cursos_con_datos])
+            await send_message(BOT_PROFE_TOKEN, chat_id,
+                f"📊 ¿De qué materia quieres el Excel?\n\nMaterias disponibles:\n{lista}\n\nEscribe el nombre de la materia:")
+
+    elif text and text.startswith("/responder_voz"):
+        partes = text.split(" ", 1)
+        if len(partes) >= 2:
+            try:
+                estudiante_id = int(partes[1].strip())
+                set_estado(db, telegram_id, "paso", f"responder_voz_{estudiante_id}")
+                await send_message(BOT_PROFE_TOKEN, chat_id,
+                    f"🎙️ Listo. Ahora graba y envía tu nota de voz para el estudiante <code>{estudiante_id}</code>.")
+            except:
+                await send_message(BOT_PROFE_TOKEN, chat_id,
+                    "❌ Formato incorrecto.\nUsa: <code>/responder_voz ID_ESTUDIANTE</code>")
+        else:
+            await send_message(BOT_PROFE_TOKEN, chat_id,
+                "❌ Formato incorrecto.\nUsa: <code>/responder_voz ID_ESTUDIANTE</code>")
+
+    elif text and text.startswith("/responder"):
+        partes = text.split(" ", 2)
+        if len(partes) >= 3:
+            try:
+                estudiante_chat_id = int(partes[1])
+                respuesta = partes[2]
+                await send_message(BOT_ESTUDIANTE_TOKEN, estudiante_chat_id,
+                    f"📬 <b>Respuesta de tu profe:</b>\n\n{respuesta}")
+                await send_message(BOT_PROFE_TOKEN, chat_id, "✅ Respuesta enviada al estudiante.")
+            except Exception as e:
+                await send_message(BOT_PROFE_TOKEN, chat_id,
+                    f"❌ Error: {str(e)}\nFormato: <code>/responder ID_ESTUDIANTE tu respuesta</code>")
+        else:
+            await send_message(BOT_PROFE_TOKEN, chat_id,
+                "❌ Formato incorrecto.\nUsa: <code>/responder ID_ESTUDIANTE tu respuesta aqui</code>")
+
+    elif text and not text.startswith("/"):
+        paso = get_estado(db, telegram_id, "paso")
+
+        if paso == "esperando_nombre_curso" and profe and profe.activo:
+            partes = text.rsplit(" ", 1)
+            nom = partes[0]
+            grado = partes[1] if len(partes) > 1 else ""
+            nuevo_curso = Curso(id=uuid.uuid4(), profe_id=profe.id, nombre=nom, grado=grado)
+            db.add(nuevo_curso)
+            del_estado(db, telegram_id, "paso")
+            db.commit()
+            await send_message(BOT_PROFE_TOKEN, chat_id,
+                f"✅ Curso <b>{nom} {grado}</b> creado!\n\nUsa /subirquiz para subir un quiz.")
+
+        elif paso == "esperando_nombre_quiz":
+            set_estado(db, telegram_id, "quiz_nombre", text.strip())
+            set_estado(db, telegram_id, "paso", "esperando_pdf_zipgrade")
+            await send_message(BOT_PROFE_TOKEN, chat_id,
+                f"✅ Quiz: <b>{text.strip()}</b>\n\n📎 Ahora envíame el PDF de ZipGrade.")
+
+        elif paso == "esperando_materia_excel":
+            materia = text.strip()
+            del_estado(db, telegram_id, "paso")
+            quizzes = db.query(Resultado.quiz_nombre).filter(
+                Resultado.curso_nombre.ilike(f"%{materia}%"),
+                Resultado.confirmado == True,
+                Resultado.quiz_nombre != None,
+                Resultado.profe_telegram_id == telegram_id
+            ).distinct().all()
+            if not quizzes:
+                await send_message(BOT_PROFE_TOKEN, chat_id,
+                    f"❌ No encontré resultados para <b>{materia}</b>.")
+            else:
+                botones_lista = [[{"text": f"📝 {q[0]}", "callback_data": f"excel_quiz_{materia}|{q[0]}"}] for q in quizzes]
+                botones_lista.append([{"text": "📊 Todos los quizzes", "callback_data": f"excel_todos_{materia}"}])
+                botones = {"inline_keyboard": botones_lista}
+                await send_message(BOT_PROFE_TOKEN, chat_id,
+                    f"📚 <b>{materia}</b> — ¿De qué quiz quieres el Excel?",
+                    reply_markup=botones)
+
+        elif "PAG" in text[:5]:
+            resultados_db = db.query(Resultado).filter(
+                Resultado.nombre_temp.like("PAG%"),
+                Resultado.confirmado == False,
+                Resultado.profe_telegram_id == telegram_id
+            ).all()
+            if not resultados_db:
+                await send_message(BOT_PROFE_TOKEN, chat_id,
+                    "❌ No encontré el PDF procesado. Por favor vuelve a enviar el PDF primero.")
+                return {"ok": True}
+            lineas = [l.strip() for l in text.split('\n') if l.strip() and l.strip()[:3] == "PAG"]
+            nombres_asignados = 0
+            for linea in lineas:
+                try:
+                    partes = linea.split(":")
+                    num_pag = int(partes[0].replace("PAG", "").strip())
+                    nombre_real = partes[1].split("-")[0].strip()
+                    for r in resultados_db:
+                        if r.pagina == num_pag:
+                            r.nombre_temp = nombre_real
+                            r.confirmado = True
+                            nombres_asignados += 1
+                            break
+                except:
+                    continue
+            db.commit()
+            del_estado(db, telegram_id, "paso")
+            del_estado(db, telegram_id, "curso_seleccionado")
+            del_estado(db, telegram_id, "quiz_nombre")
+            curso_n = resultados_db[0].curso_nombre if resultados_db else ""
+            quiz_n = resultados_db[0].quiz_nombre if resultados_db else ""
+            resumen = "\n".join([f"• <b>{r.nombre_temp}</b>: {r.nota}/5.0" for r in resultados_db])
+            await send_message(BOT_PROFE_TOKEN, chat_id,
+                f"✅ <b>{nombres_asignados} estudiantes guardados!</b>\n"
+                f"📚 Curso: <b>{curso_n}</b>\n📝 Quiz: <b>{quiz_n}</b>\n\n{resumen}\n\n"
+                f"💡 Usa /excel o /estadisticas para ver reportes.")
+
+        else:
+            await send_message(BOT_PROFE_TOKEN, chat_id,
+                "Comandos:\n/start\n/micursos\n/nuevocurso\n/subirquiz\n/excel\n/estadisticas\n/enviar\n/estado")
 
     return {"ok": True}
 
 @app.post("/webhook/estudiante")
 async def webhook_estudiante(request: Request, db: Session = Depends(get_db)):
-    try: data = await request.json()
-    except Exception: return {"ok": True}
-
+    data = await request.json()
     callback = data.get("callback_query", {})
+    message = data.get("message", {})
+
     if callback:
         chat_id = callback.get("from", {}).get("id")
         telegram_id = chat_id
         cb_data = callback.get("data", "")
-        
-        if cb_data.startswith("entrar_grupo_"):
-            curso_id = cb_data.replace("entrar_grupo_", "")
-            c_uuid = uuid.UUID(curso_id)
-            curso = db.query(Curso).filter(Curso.id == c_uuid).first()
-            if curso:
-                estudiante_grupo_estado[telegram_id] = {"curso_id": str(curso_id), "curso_nombre": curso.nombre, "curso_grado": curso.grado}
-                await send_message(BOT_ESTUDIANTE_TOKEN, chat_id, f"📥 Conectado al aula: {curso.nombre}. Escribe /salir para terminar.")
-                await cargar_historial_grupo(db, BOT_ESTUDIANTE_TOKEN, chat_id, str(curso_id))
+
+        if cb_data.startswith("duda_materia_"):
+            partes = cb_data.replace("duda_materia_", "").split("|", 1)
+            materia = partes[0]
+            profe_tid = int(partes[1]) if len(partes) > 1 else PROFE_CHAT_ID
+            set_estado(db, telegram_id, "duda_materia", materia)
+            set_estado(db, telegram_id, "duda_profe_id", str(profe_tid))
+            set_estado(db, telegram_id, "esperando_duda", "si")
+            set_estado(db, telegram_id, "sesion_inicio", datetime.now().isoformat())
+            await send_message(BOT_ESTUDIANTE_TOKEN, chat_id,
+                f"📚 Materia: <b>{materia}</b>\n\n"
+                f"✏️ Puedes enviar mensajes de texto, notas de voz 🎙️, archivos 📎, imágenes 🖼️ y videos 🎥 libremente durante 15 minutos.\n\n"
+                f"La sesion se cerrara automaticamente.")
         return {"ok": True}
 
-    message = data.get("message", {})
     chat_id = message.get("chat", {}).get("id")
     text = message.get("text", "")
     telegram_id = message.get("from", {}).get("id")
     nombre = message.get("from", {}).get("first_name", "Estudiante")
-    
-    if not chat_id: return {"ok": True}
+    voice = message.get("voice", {})
+    photo = message.get("photo", [])
+    video = message.get("video", {})
+    document = message.get("document", {})
+
+    if not chat_id:
+        return {"ok": True}
+
     estudiante = db.query(Estudiante).filter(Estudiante.telegram_id == telegram_id).first()
 
+    # NOTA DE VOZ DEL ESTUDIANTE
+    if voice:
+        esperando = get_estado(db, telegram_id, "esperando_duda")
+        if esperando == "si" and sesion_activa(db, telegram_id):
+            voice_file_id = voice.get("file_id")
+            nombre_est = estudiante.nombre if estudiante else nombre
+            materia_duda = get_estado(db, telegram_id, "duda_materia") or "Sin materia"
+            profe_id_str = get_estado(db, telegram_id, "duda_profe_id")
+            profe_dest = int(profe_id_str) if profe_id_str else PROFE_CHAT_ID
+            await send_message(BOT_PROFE_TOKEN, profe_dest,
+                f"🎙️ <b>Nota de voz de estudiante:</b>\n"
+                f"👤 <b>{nombre_est}</b> | 📚 <b>{materia_duda}</b>\n"
+                f"Para responder con texto: <code>/responder {telegram_id} tu respuesta</code>\n"
+                f"Para responder con voz: <code>/responder_voz {telegram_id}</code>\n"
+                f"Para enviar archivo: <code>/enviar_a {telegram_id}</code>")
+            await send_voice(BOT_PROFE_TOKEN, profe_dest, voice_file_id, BOT_ESTUDIANTE_TOKEN)
+            await send_message(BOT_ESTUDIANTE_TOKEN, chat_id, "✅ Nota de voz enviada. Puedes seguir enviando mensajes.")
+        elif esperando == "si" and not sesion_activa(db, telegram_id):
+            del_estado(db, telegram_id, "esperando_duda")
+            del_estado(db, telegram_id, "duda_materia")
+            del_estado(db, telegram_id, "duda_profe_id")
+            del_estado(db, telegram_id, "sesion_inicio")
+            await send_message(BOT_ESTUDIANTE_TOKEN, chat_id,
+                "⏰ Tu sesion de 15 minutos ha expirado.\n\nUsa /duda para iniciar una nueva sesion.")
+        else:
+            await send_message(BOT_ESTUDIANTE_TOKEN, chat_id,
+                "❌ Primero usa /duda para iniciar una consulta con tu profe.")
+        return {"ok": True}
+
+    # ARCHIVO / IMAGEN / VIDEO DEL ESTUDIANTE → enviar al profe
+    archivo_recibido = None
+    archivo_tipo = None
+    archivo_nombre = "archivo"
+
+    if photo:
+        archivo_recibido = photo[-1].get("file_id")
+        archivo_tipo = "photo"
+        archivo_nombre = "imagen.jpg"
+    elif video:
+        archivo_recibido = video.get("file_id")
+        archivo_tipo = "video"
+        archivo_nombre = video.get("file_name", "video.mp4")
+    elif document and not text:
+        archivo_recibido = document.get("file_id")
+        archivo_tipo = "document"
+        archivo_nombre = document.get("file_name", "archivo")
+
+    if archivo_recibido:
+        esperando = get_estado(db, telegram_id, "esperando_duda")
+        if esperando == "si" and sesion_activa(db, telegram_id):
+            nombre_est = estudiante.nombre if estudiante else nombre
+            materia_duda = get_estado(db, telegram_id, "duda_materia") or "Sin materia"
+            profe_id_str = get_estado(db, telegram_id, "duda_profe_id")
+            profe_dest = int(profe_id_str) if profe_id_str else PROFE_CHAT_ID
+            await send_message(BOT_PROFE_TOKEN, profe_dest,
+                f"📎 <b>Archivo de estudiante:</b>\n"
+                f"👤 <b>{nombre_est}</b> | 📚 <b>{materia_duda}</b>\n"
+                f"Para responder: <code>/responder {telegram_id} tu respuesta</code>\n"
+                f"Para enviar archivo: <code>/enviar_a {telegram_id}</code>")
+            await reenviar_archivo(BOT_PROFE_TOKEN, profe_dest, archivo_recibido,
+                BOT_ESTUDIANTE_TOKEN, archivo_nombre, "", archivo_tipo)
+            await send_message(BOT_ESTUDIANTE_TOKEN, chat_id, "✅ Archivo enviado a tu profe.")
+        elif esperando == "si" and not sesion_activa(db, telegram_id):
+            del_estado(db, telegram_id, "esperando_duda")
+            del_estado(db, telegram_id, "duda_materia")
+            del_estado(db, telegram_id, "duda_profe_id")
+            del_estado(db, telegram_id, "sesion_inicio")
+            await send_message(BOT_ESTUDIANTE_TOKEN, chat_id,
+                "⏰ Tu sesion de 15 minutos ha expirado.\n\nUsa /duda para iniciar una nueva sesion.")
+        else:
+            await send_message(BOT_ESTUDIANTE_TOKEN, chat_id,
+                "❌ Para enviar archivos a tu profe primero usa /duda para iniciar una consulta.")
+        return {"ok": True}
+
     if text == "/start":
-        if estudiante and estudiante.activo:
-            await send_message(BOT_ESTUDIANTE_TOKEN, chat_id, "👋 Hola de nuevo. Comandos:\n/misnotas - Ver notas\n/grupos - Entrar a una clase\n/salir - Salir del grupo")
-        return {"ok": True}
+        if not estudiante:
+            nuevo = Estudiante(id=uuid.uuid4(), telegram_id=telegram_id, nombre=nombre, apellido="", activo=True)
+            db.add(nuevo)
+            db.commit()
+            await send_message(BOT_ESTUDIANTE_TOKEN, chat_id,
+                f"👋 Hola <b>{nombre}</b>!\n\nBienvenido al sistema ZipGrade.\n\n"
+                f"Puedes:\n• Escribir tu <b>nombre</b> para ver todas tus notas\n"
+                f"• Escribir una <b>materia</b> para ver notas de esa materia\n"
+                f"• Usar /grafico para ver tu grafico de rendimiento\n"
+                f"• Usar /duda para contactar a tu profe (texto, voz 🎙️, archivos 📎, imágenes 🖼️, videos 🎥)")
+        else:
+            await send_message(BOT_ESTUDIANTE_TOKEN, chat_id,
+                f"✅ Hola <b>{estudiante.nombre}</b>!\n\n"
+                f"Comandos:\n/grafico - Ver tu grafico de rendimiento\n/duda - Contactar al profe")
 
-    if text == "/salir":
-        if telegram_id in estudiante_grupo_estado:
-            del estudiante_grupo_estado[telegram_id]
-            await send_message(BOT_ESTUDIANTE_TOKEN, chat_id, "🚪 Saliste del grupo de manera segura.")
-        return {"ok": True}
+    elif text == "/duda":
+        est = db.query(Estudiante).filter(Estudiante.telegram_id == telegram_id).first()
+        if not est or not est.nombre:
+            await send_message(BOT_ESTUDIANTE_TOKEN, chat_id,
+                "❌ Primero escribe tu nombre completo para registrarte.")
+            return {"ok": True}
+        materias = db.query(
+            Resultado.curso_nombre,
+            Resultado.profe_telegram_id
+        ).filter(
+            Resultado.nombre_temp.ilike(f"%{est.nombre}%"),
+            Resultado.confirmado == True,
+            Resultado.curso_nombre != None,
+            Resultado.profe_telegram_id != None
+        ).distinct().all()
+        if not materias:
+            await send_message(BOT_ESTUDIANTE_TOKEN, chat_id,
+                "❌ No tienes materias registradas aun. Escribe tu nombre primero.")
+        else:
+            botones = {"inline_keyboard": [
+                [{"text": f"📚 {m[0]}", "callback_data": f"duda_materia_{m[0]}|{m[1]}"}]
+                for m in materias
+            ]}
+            await send_message(BOT_ESTUDIANTE_TOKEN, chat_id,
+                "📚 ¿Sobre qué materia tienes la duda?",
+                reply_markup=botones)
 
-    if text == "/grupos":
-        if estudiante and estudiante.activo:
-            # CORRECCIÓN AQUÍ: Conversión explícita a UUID del ID del estudiante
-            e_uuid = uuid.UUID(str(estudiante.id))
-            inscripciones = db.query(CursoEstudiante).filter(CursoEstudiante.estudiante_id == e_uuid).all()
-            if inscripciones:
-                botones = []
-                for ins in inscripciones:
-                    c = db.query(Curso).filter(Curso.id == ins.curso_id).first()
-                    if c: botones.append([{"text": f"📖 Entrar a {c.nombre}", "callback_data": f"entrar_grupo_{c.id}"}])
-                await send_message(BOT_ESTUDIANTE_TOKEN, chat_id, "🔍 Selecciona la asignatura:", reply_markup={"inline_keyboard": botones})
+    elif text == "/grafico":
+        est = db.query(Estudiante).filter(Estudiante.telegram_id == telegram_id).first()
+        if not est or not est.nombre:
+            await send_message(BOT_ESTUDIANTE_TOKEN, chat_id,
+                "❌ Primero escribe tu nombre completo para registrarte.")
+            return {"ok": True}
+        resultados = db.query(Resultado).filter(
+            Resultado.nombre_temp.ilike(f"%{est.nombre}%"),
+            Resultado.confirmado == True,
+            Resultado.curso_nombre != None
+        ).all()
+        if not resultados:
+            await send_message(BOT_ESTUDIANTE_TOKEN, chat_id, "❌ No tienes resultados registrados aun.")
+        else:
+            await send_message(BOT_ESTUDIANTE_TOKEN, chat_id, "⏳ Generando tu grafico de rendimiento...")
+            grafico = generar_grafico_estudiante(est.nombre, resultados)
+            if grafico:
+                await send_photo_bytes(BOT_ESTUDIANTE_TOKEN, chat_id, grafico,
+                    f"📊 Tu rendimiento academico, {est.nombre}")
             else:
-                await send_message(BOT_ESTUDIANTE_TOKEN, chat_id, "No estás inscrito en ningún curso.")
-        return {"ok": True}
+                await send_message(BOT_ESTUDIANTE_TOKEN, chat_id, "❌ Error generando el grafico.")
 
-    if telegram_id in estudiante_grupo_estado:
-        c_id = estudiante_grupo_estado[telegram_id]["curso_id"]
-        if text: await registrar_y_transmitir_en_grupo(db, c_id, telegram_id, nombre, {"text": text}, "text", es_profe=False)
-        elif message.get("document"): await registrar_y_transmitir_en_grupo(db, c_id, telegram_id, nombre, {"file_id": message["document"]["file_id"], "caption": message.get("caption", "")}, "document", es_profe=False)
-        elif message.get("photo"): await registrar_y_transmitir_en_grupo(db, c_id, telegram_id, nombre, {"file_id": message["photo"][-1]["file_id"], "caption": message.get("caption", "")}, "photo", es_profe=False)
-        elif message.get("voice"): await registrar_y_transmitir_en_grupo(db, c_id, telegram_id, nombre, {"file_id": message["voice"]["file_id"]}, "voice", es_profe=False)
-        elif message.get("video"): await registrar_y_transmitir_en_grupo(db, c_id, telegram_id, nombre, {"file_id": message["video"]["file_id"], "caption": message.get("caption", "")}, "video", es_profe=False)
-        return {"ok": True}
+    elif text and not text.startswith("/"):
+        esperando = get_estado(db, telegram_id, "esperando_duda")
+
+        if esperando == "si" and sesion_activa(db, telegram_id):
+            nombre_est = estudiante.nombre if estudiante else nombre
+            materia_duda = get_estado(db, telegram_id, "duda_materia") or "Sin materia"
+            profe_id_str = get_estado(db, telegram_id, "duda_profe_id")
+            profe_dest = int(profe_id_str) if profe_id_str else PROFE_CHAT_ID
+            mins = tiempo_restante(db, telegram_id)
+            await send_message(BOT_PROFE_TOKEN, profe_dest,
+                f"📩 <b>Mensaje de estudiante:</b>\n"
+                f"👤 <b>{nombre_est}</b> | 📚 <b>{materia_duda}</b>\n\n"
+                f"💬 {text}\n\n"
+                f"Para responder con texto: <code>/responder {telegram_id} tu respuesta</code>\n"
+                f"Para responder con voz: <code>/responder_voz {telegram_id}</code>\n"
+                f"Para enviar archivo: <code>/enviar_a {telegram_id}</code>")
+            await send_message(BOT_ESTUDIANTE_TOKEN, chat_id,
+                f"✅ Mensaje enviado. Sesion activa por {mins} min mas.")
+        elif esperando == "si" and not sesion_activa(db, telegram_id):
+            del_estado(db, telegram_id, "esperando_duda")
+            del_estado(db, telegram_id, "duda_materia")
+            del_estado(db, telegram_id, "duda_profe_id")
+            del_estado(db, telegram_id, "sesion_inicio")
+            await send_message(BOT_ESTUDIANTE_TOKEN, chat_id,
+                "⏰ Tu sesion de 15 minutos ha expirado.\n\nUsa /duda para iniciar una nueva sesion.")
+        else:
+            busqueda = text.strip()
+            resultados_materia = db.query(Resultado).filter(
+                Resultado.curso_nombre.ilike(f"%{busqueda}%"),
+                Resultado.confirmado == True
+            ).all()
+            resultados_nombre = db.query(Resultado).filter(
+                Resultado.nombre_temp.ilike(f"%{busqueda}%"),
+                Resultado.confirmado == True
+            ).all()
+
+            if resultados_materia and not resultados_nombre:
+                est = db.query(Estudiante).filter(Estudiante.telegram_id == telegram_id).first()
+                if est and est.nombre:
+                    resultados = db.query(Resultado).filter(
+                        Resultado.curso_nombre.ilike(f"%{busqueda}%"),
+                        Resultado.nombre_temp.ilike(f"%{est.nombre}%"),
+                        Resultado.confirmado == True
+                    ).all()
+                    if not resultados:
+                        await send_message(BOT_ESTUDIANTE_TOKEN, chat_id,
+                            f"❌ No encontré tus notas en <b>{busqueda}</b>.")
+                    else:
+                        msg = f"📚 <b>Tus notas en {busqueda.title()}:</b>\n\n"
+                        for r in resultados:
+                            msg += f"📝 <b>{r.quiz_nombre}</b>: {r.nota}/5.0 ({r.porcentaje}%)\n"
+                        await send_message(BOT_ESTUDIANTE_TOKEN, chat_id, msg)
+                        for r in resultados:
+                            if r.imagen_url:
+                                await send_photo(BOT_ESTUDIANTE_TOKEN, chat_id, r.imagen_url,
+                                    f"📋 {r.quiz_nombre} - Tu hoja de respuestas")
+                            if r.quiz_pdf_url:
+                                await send_document_url(BOT_ESTUDIANTE_TOKEN, chat_id, r.quiz_pdf_url,
+                                    f"📄 {r.quiz_nombre} - PDF del quiz")
+                else:
+                    await send_message(BOT_ESTUDIANTE_TOKEN, chat_id,
+                        f"❌ Primero escribe tu nombre completo para registrarte.")
+
+            elif resultados_nombre:
+                est = db.query(Estudiante).filter(Estudiante.telegram_id == telegram_id).first()
+                if est and est.nombre != busqueda:
+                    est.nombre = busqueda
+                    db.commit()
+                msg = f"📊 <b>Todas tus notas ({busqueda}):</b>\n\n"
+                for r in resultados_nombre:
+                    curso = r.curso_nombre or "Sin curso"
+                    quiz = r.quiz_nombre or "Sin quiz"
+                    msg += f"📚 <b>{curso}</b> - {quiz}: <b>{r.nota}/5.0</b> ({r.porcentaje}%)\n"
+                await send_message(BOT_ESTUDIANTE_TOKEN, chat_id, msg)
+                for r in resultados_nombre:
+                    if r.imagen_url:
+                        await send_photo(BOT_ESTUDIANTE_TOKEN, chat_id, r.imagen_url,
+                            f"📋 {r.curso_nombre} - {r.quiz_nombre}")
+                    if r.quiz_pdf_url:
+                        await send_document_url(BOT_ESTUDIANTE_TOKEN, chat_id, r.quiz_pdf_url,
+                            f"📄 {r.curso_nombre} - {r.quiz_nombre}")
+            else:
+                await send_message(BOT_ESTUDIANTE_TOKEN, chat_id,
+                    f"❌ No encontré resultados para <b>{busqueda}</b>.\n\n"
+                    f"Intenta con tu nombre completo o el nombre de la materia.\n"
+                    f"¿Tienes una duda? Usa /duda para contactar a tu profe.")
 
     return {"ok": True}
 
-# --- ENPOINTS DE CONTROL COMPATIBLES CON UUID ---
 @app.post("/profes/registrar")
 def registrar_profe(data: dict, db: Session = Depends(get_db)):
-    p = db.query(Profe).filter(Profe.telegram_id == data["telegram_id"]).first()
-    if p: return {"id": str(p.id), "nombre": p.nombre, "activo": p.activo}
+    profe = db.query(Profe).filter(Profe.telegram_id == data["telegram_id"]).first()
+    if profe:
+        return {"id": str(profe.id), "nombre": profe.nombre, "activo": profe.activo}
     nuevo = Profe(id=uuid.uuid4(), telegram_id=data["telegram_id"], nombre=data.get("nombre", ""), email="", activo=False)
     db.add(nuevo)
     db.commit()
@@ -289,9 +1125,10 @@ def registrar_profe(data: dict, db: Session = Depends(get_db)):
 
 @app.get("/profes/by-telegram/{telegram_id}")
 def get_profe_by_telegram(telegram_id: int, db: Session = Depends(get_db)):
-    p = db.query(Profe).filter(Profe.telegram_id == telegram_id).first()
-    if not p: raise HTTPException(status_code=404, detail="No encontrado")
-    return {"id": str(p.id), "nombre": p.nombre, "activo": p.activo}
+    profe = db.query(Profe).filter(Profe.telegram_id == telegram_id).first()
+    if not profe:
+        raise HTTPException(status_code=404, detail="Profe no encontrado")
+    return {"id": str(profe.id), "nombre": profe.nombre, "activo": profe.activo}
 
 @app.get("/profes/activo/{telegram_id}")
 def check_profe_activo(telegram_id: int, db: Session = Depends(get_db)):
@@ -299,8 +1136,9 @@ def check_profe_activo(telegram_id: int, db: Session = Depends(get_db)):
 
 @app.post("/estudiantes/registrar")
 def registrar_estudiante(data: dict, db: Session = Depends(get_db)):
-    e = db.query(Estudiante).filter(Estudiante.telegram_id == data["telegram_id"]).first()
-    if e: return {"id": str(e.id), "nombre": e.nombre, "activo": e.activo}
+    est = db.query(Estudiante).filter(Estudiante.telegram_id == data["telegram_id"]).first()
+    if est:
+        return {"id": str(est.id), "nombre": est.nombre, "activo": est.activo}
     nuevo = Estudiante(id=uuid.uuid4(), telegram_id=data["telegram_id"], nombre=data.get("nombre", ""), apellido="", activo=False)
     db.add(nuevo)
     db.commit()
@@ -308,9 +1146,10 @@ def registrar_estudiante(data: dict, db: Session = Depends(get_db)):
 
 @app.get("/estudiantes/by-telegram/{telegram_id}")
 def get_estudiante_by_telegram(telegram_id: int, db: Session = Depends(get_db)):
-    e = db.query(Estudiante).filter(Estudiante.telegram_id == telegram_id).first()
-    if not e: raise HTTPException(status_code=404, detail="No encontrado")
-    return {"id": str(e.id), "nombre": e.nombre, "apellido": e.apellido, "activo": e.activo}
+    est = db.query(Estudiante).filter(Estudiante.telegram_id == telegram_id).first()
+    if not est:
+        raise HTTPException(status_code=404, detail="Estudiante no encontrado")
+    return {"id": str(est.id), "nombre": est.nombre, "apellido": est.apellido, "activo": est.activo}
 
 @app.get("/estudiantes/activo/{telegram_id}")
 def check_estudiante_activo(telegram_id: int, db: Session = Depends(get_db)):
@@ -318,22 +1157,30 @@ def check_estudiante_activo(telegram_id: int, db: Session = Depends(get_db)):
 
 @app.post("/cursos/crear")
 def crear_curso(data: dict, db: Session = Depends(get_db)):
-    p_uuid = uuid.UUID(data["profe_id"])
-    nuevo = Curso(id=uuid.uuid4(), profe_id=p_uuid, nombre=data["nombre"], grado=data.get("grado", ""))
+    nuevo = Curso(id=uuid.uuid4(), profe_id=data["profe_id"], nombre=data["nombre"], grado=data.get("grado", ""))
     db.add(nuevo)
     db.commit()
     return {"id": str(nuevo.id), "nombre": nuevo.nombre, "grado": nuevo.grado}
 
 @app.get("/cursos/by-profe-telegram/{telegram_id}")
-def courses_by_profe(telegram_id: int, db: Session = Depends(get_db)):
-    p = db.query(Profe).filter(Profe.telegram_id == telegram_id).first()
-    if not p: return []
-    return [{"id": str(c.id), "nombre": c.nombre, "grado": c.grado} for c in db.query(Curso).filter(Curso.profe_id == p.id).all()]
+def cursos_by_profe(telegram_id: int, db: Session = Depends(get_db)):
+    profe = db.query(Profe).filter(Profe.telegram_id == telegram_id).first()
+    if not profe:
+        return []
+    cursos = db.query(Curso).filter(Curso.profe_id == profe.id).all()
+    return [{"id": str(c.id), "nombre": c.nombre, "grado": c.grado} for c in cursos]
+
+@app.post("/quizzes/procesar-pdf")
+async def procesar_pdf_endpoint(archivo: UploadFile = File(...), curso_id: str = Form(...), db: Session = Depends(get_db)):
+    contenido = await archivo.read()
+    resultados = await procesar_pdf_zipgrade(contenido)
+    return {"resultados": resultados, "total": len(resultados)}
 
 @app.get("/resultados/historial/{estudiante_id}")
 def historial_estudiante(estudiante_id: str, db: Session = Depends(get_db)):
-    e_uuid = uuid.UUID(estudiante_id)
-    return db.query(Resultado).filter(Resultado.estudiante_id == e_uuid, Resultado.confirmado == True).all()
+    return db.query(Resultado).filter(
+        Resultado.estudiante_id == estudiante_id,
+        Resultado.confirmado == True).all()
 
 @app.post("/admin/activar-profe/{telegram_id}")
 def admin_activar_profe(telegram_id: int, db: Session = Depends(get_db)):
@@ -354,3 +1201,9 @@ def admin_activar_estudiante(telegram_id: int, db: Session = Depends(get_db)):
 def admin_desactivar_estudiante(telegram_id: int, db: Session = Depends(get_db)):
     desactivar_estudiante(telegram_id, db)
     return {"ok": True}
+Por ultimo pega esto en el CDM y enter:
+git add backend\main.py
+git commit -m "envio de archivos imagenes y videos bidireccional"
+git push origin master
+
+
