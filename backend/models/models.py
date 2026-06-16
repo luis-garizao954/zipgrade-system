@@ -1,76 +1,61 @@
-from sqlalchemy import Column, Boolean, DateTime, Integer, Numeric, Date, ForeignKey, BigInteger, Text
-from sqlalchemy.dialects.postgresql import UUID
-from sqlalchemy.orm import relationship, declarative_base
-from sqlalchemy.sql import func
 import uuid
+from sqlalchemy import Column, String, Boolean, Float, ForeignKey, Integer, DateTime
+from sqlalchemy.ext.declarative import declarative_base
+import datetime
 
 Base = declarative_base()
 
 class Profe(Base):
     __tablename__ = "profes"
-    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    telegram_id = Column(BigInteger, unique=True, nullable=False)
-    nombre = Column(Text, nullable=False)
-    email = Column(Text)
+    id = Column(String, default=lambda: str(uuid.uuid4()), primary_key=True)
+    telegram_id = Column(Integer, unique=True, nullable=False)
+    nombre = Column(String, nullable=False)
+    email = Column(String, default="")
     activo = Column(Boolean, default=False)
-    en_prueba = Column(Boolean, default=True)
-    prueba_inicio = Column(DateTime)
-    prueba_fin = Column(DateTime)
-    suscripcion_hasta = Column(DateTime)
-    created_at = Column(DateTime, server_default=func.now())
-    cursos = relationship("Curso", back_populates="profe", cascade="all, delete")
 
 class Estudiante(Base):
     __tablename__ = "estudiantes"
-    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    telegram_id = Column(BigInteger, unique=True, nullable=False)
-    nombre = Column(Text, nullable=False)
-    apellido = Column(Text, default="")
+    id = Column(String, default=lambda: str(uuid.uuid4()), primary_key=True)
+    telegram_id = Column(Integer, unique=True, nullable=False)
+    nombre = Column(String, nullable=False)
+    apellido = Column(String, default="")
     activo = Column(Boolean, default=False)
-    en_prueba = Column(Boolean, default=True)
-    prueba_inicio = Column(DateTime)
-    prueba_fin = Column(DateTime)
-    suscripcion_hasta = Column(DateTime)
-    created_at = Column(DateTime, server_default=func.now())
 
 class Curso(Base):
     __tablename__ = "cursos"
-    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    profe_id = Column(UUID(as_uuid=True), ForeignKey("profes.id", ondelete="CASCADE"))
-    nombre = Column(Text, nullable=False)
-    grado = Column(Text)
-    created_at = Column(DateTime, server_default=func.now())
-    profe = relationship("Profe", back_populates="cursos")
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    profe_id = Column(String, ForeignKey("profes.id"))
+    nombre = Column(String, nullable=False)
+    grado = Column(String, default="")
 
 class CursoEstudiante(Base):
     __tablename__ = "curso_estudiantes"
-    curso_id = Column(UUID(as_uuid=True), ForeignKey("cursos.id", ondelete="CASCADE"), primary_key=True)
-    estudiante_id = Column(UUID(as_uuid=True), ForeignKey("estudiantes.id", ondelete="CASCADE"), primary_key=True)
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    curso_id = Column(String, ForeignKey("cursos.id"))
+    estudiante_id = Column(String, ForeignKey("estudiantes.id"))
 
 class Quiz(Base):
     __tablename__ = "quizzes"
-    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    curso_id = Column(UUID(as_uuid=True), ForeignKey("cursos.id", ondelete="CASCADE"))
-    nombre = Column(Text, nullable=False)
-    fecha = Column(Date, server_default=func.current_date())
-    total_preguntas = Column(Integer, default=20)
-    created_at = Column(DateTime, server_default=func.now())
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    curso_id = Column(String, ForeignKey("cursos.id"))
+    nombre = Column(String, nullable=False)
 
 class Resultado(Base):
     __tablename__ = "resultados"
-    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    quiz_id = Column(UUID(as_uuid=True), nullable=True)
-    estudiante_id = Column(UUID(as_uuid=True), nullable=True)
-    nombre_temp = Column(Text)
-    nota = Column(Numeric(4, 2))
-    puntos = Column(Numeric(6, 2))
-    posibles = Column(Numeric(6, 2))
-    porcentaje = Column(Numeric(5, 2))
-    pagina = Column(Integer)
-    imagen_url = Column(Text)
-    quiz_pdf_url = Column(Text)
-    curso_nombre = Column(Text)
-    quiz_nombre = Column(Text)
-    profe_telegram_id = Column(BigInteger)
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    quiz_id = Column(String, ForeignKey("quizzes.id"))
+    estudiante_id = Column(String, ForeignKey("estudiantes.id"))
+    nota = Column(Float, nullable=False)
+    porcentaje = Column(Float, default=0.0)
     confirmado = Column(Boolean, default=False)
-    created_at = Column(DateTime, server_default=func.now())
+
+class MensajeGrupo(Base):
+    __tablename__ = "mensaje_grupos"
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    curso_id = Column(String, ForeignKey("cursos.id"), nullable=False)
+    remitente_nombre = Column(String, nullable=False)
+    tipo_mensaje = Column(String, nullable=False)
+    texto = Column(String, nullable=True)
+    file_id = Column(String, nullable=True)
+    caption = Column(String, nullable=True)
+    fecha_envio = Column(DateTime, default=datetime.datetime.utcnow)
