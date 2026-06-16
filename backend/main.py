@@ -1,3 +1,4 @@
+
 from fastapi import FastAPI, Depends, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import create_engine
@@ -44,7 +45,9 @@ async def send_message(token, chat_id, text, reply_markup=None):
 
 async def cargar_historial_grupo(db: Session, token: str, chat_id: int, curso_id: str):
     try:
-        mensajes = db.query(MensajeGrupo).filter(MensajeGrupo.curso_id == curso_id).order_by(MensajeGrupo.fecha_envio.asc()).all()
+        # Conversión segura a UUID para la consulta
+        c_uuid = uuid.UUID(curso_id)
+        mensajes = db.query(MensajeGrupo).filter(MensajeGrupo.curso_id == c_uuid).order_by(MensajeGrupo.fecha_envio.asc()).all()
         if not mensajes:
             await send_message(token, chat_id, "📭 <i>Este grupo no tiene mensajes compartidos todavía.</i>")
             return
@@ -60,7 +63,8 @@ async def cargar_historial_grupo(db: Session, token: str, chat_id: int, curso_id
 
 async def alertar_conexion_profe(db: Session, curso_id: str, nombre_prof: str, curso_nombre: str, curso_grado: str):
     try:
-        inscripciones = db.query(CursoEstudiante).filter(CursoEstudiante.curso_id == curso_id).all()
+        c_uuid = uuid.UUID(curso_id)
+        inscripciones = db.query(CursoEstudiante).filter(CursoEstudiante.curso_id == c_uuid).all()
         texto_alerta = (
             f"👨‍🏫 <b>Notificación Escolar:</b>\n\n"
             f"El profesor <b>{nombre_prof}</b> se conectó al grupo de <b>{curso_nombre} {curso_grado}</b>.\n\n"
@@ -75,10 +79,11 @@ async def alertar_conexion_profe(db: Session, curso_id: str, nombre_prof: str, c
 
 async def registrar_y_transmitir_en_grupo(db: Session, curso_id: str, remitente_telegram_id: int, remitente_nombre: str, data: dict, tipo_mensaje: str, es_profe: bool):
     try:
+        c_uuid = uuid.UUID(curso_id)
         etiqueta = f"👨‍🏫 [PROFE] {remitente_nombre}" if es_profe else f"👥 [GRUPO] {remitente_nombre}"
         nuevo_msg = MensajeGrupo(
-            id=str(uuid.uuid4()),
-            curso_id=curso_id,
+            id=uuid.uuid4(),
+            curso_id=c_uuid,
             remitente_nombre=etiqueta,
             tipo_mensaje=tipo_mensaje,
             texto=data.get("text"),
@@ -88,12 +93,10 @@ async def registrar_y_transmitir_en_grupo(db: Session, curso_id: str, remitente_
         db.add(nuevo_msg)
         db.commit()
 
-        # Enviar en tiempo real a estudiantes inmersos
         for est_tg_id, estado in estudiante_grupo_estado.items():
             if estado.get("curso_id") == str(curso_id) and est_tg_id != remitente_telegram_id:
                 await enviar_multimedia_generico(BOT_ESTUDIANTE_TOKEN, est_tg_id, remitente_nombre, data, tipo_mensaje, es_profe)
                 
-        # Enviar en tiempo real a profesores inmersos
         for prof_tg_id, estado in profe_grupo_estado.items():
             if estado.get("curso_id") == str(curso_id) and prof_tg_id != remitente_telegram_id:
                 await enviar_multimedia_generico(BOT_PROFE_TOKEN, prof_tg_id, remitente_nombre, data, tipo_mensaje, es_profe)
@@ -138,10 +141,8 @@ async def set_webhooks():
 
 @app.post("/webhook/profe")
 async def webhook_profe(request: Request, db: Session = Depends(get_db)):
-    try:
-        data = await request.json()
-    except Exception:
-        return {"ok": True}
+    try: data = await request.json()
+    except Exception: return {"ok": True}
 
     callback = data.get("callback_query", {})
     if callback:
@@ -152,18 +153,19 @@ async def webhook_profe(request: Request, db: Session = Depends(get_db)):
         
         if cb_data.startswith("profe_grupo_"):
             curso_id = cb_data.replace("profe_grupo_", "")
-            curso = db.query(Curso).filter(Curso.id == curso_id).first()
+            c_uuid = uuid.UUID(curso_id)
+            curso = db.query(Curso).filter(Curso.id == c_uuid).first()
             if curso:
                 profe_grupo_estado[telegram_id] = {"curso_id": str(curso_id), "curso_nombre": curso.nombre, "curso_grado": curso.grado}
-                await send_message(BOT_PROFE_TOKEN, chat_id,
-                    f"📥 <b>Inmerso en: {curso.nombre} {curso.grado}</b>\n\n🚪 Para salir usa: /salir")
+                await send_message(BOT_PROFE_TOKEN, chat_id, f"📥 <b>Inmerso en: {curso.nombre} {curso.grado}</b>\n\n🚪 Para salir usa: /salir")
                 await cargar_historial_grupo(db, BOT_PROFE_TOKEN, chat_id, str(curso_id))
                 await alertar_conexion_profe(db, str(curso_id), nombre_prof, curso.nombre, curso.grado)
             return {"ok": True}
             
         elif cb_data.startswith("curso_"):
             curso_id = cb_data.replace("curso_", "")
-            curso = db.query(Curso).filter(Curso.id == curso_id).first()
+            c_uuid = uuid.UUID(curso_id)
+            curso = db.query(Curso).filter(Curso.id == c_uuid).first()
             if curso:
                 profe_estado[telegram_id] = {"curso_id": str(curso_id), "curso_nombre": curso.nombre}
                 await send_message(BOT_PROFE_TOKEN, chat_id, f"📚 Curso seleccionado. Envía el PDF.")
@@ -180,17 +182,13 @@ async def webhook_profe(request: Request, db: Session = Depends(get_db)):
 
     if text == "/start":
         if profe and profe.activo:
-            await send_message(BOT_PROFE_TOKEN, chat_id, "✅ Panel de Control del Profesor Activo.\n\n/micursos - Ver tus cursos\n/nuevocurso - Crear curso\n/subirquiz - Evaluar con ZipGrade\n/grupos - Entrar a un Aula Virtual\n/salir - Salir del aula")
-        else:
-            await send_message(BOT_PROFE_TOKEN, chat_id, "❌ Cuenta inactiva o inexistente.")
+            await send_message(BOT_PROFE_TOKEN, chat_id, "✅ Panel del Profesor Activo.\n\n/micursos - Ver cursos\n/nuevocurso - Crear curso\n/subirquiz - Evaluar con ZipGrade\n/grupos - Entrar a un Aula Virtual\n/salir - Salir del aula")
         return {"ok": True}
 
     if text == "/salir":
         if telegram_id in profe_grupo_estado:
             del profe_grupo_estado[telegram_id]
-            await send_message(BOT_PROFE_TOKEN, chat_id, "🚪 Saliste del grupo con éxito. Volviste al menú principal.")
-        else:
-            await send_message(BOT_PROFE_TOKEN, chat_id, "No estás en ninguna asignatura.")
+            await send_message(BOT_PROFE_TOKEN, chat_id, "🚪 Saliste del grupo. Volviste al menú principal.")
         return {"ok": True}
 
     if text == "/grupos":
@@ -198,32 +196,24 @@ async def webhook_profe(request: Request, db: Session = Depends(get_db)):
         cursos = db.query(Curso).filter(Curso.profe_id == profe.id).all()
         if cursos:
             botones = [[{"text": f"👥 Aula de {c.nombre} {c.grado}", "callback_data": f"profe_grupo_{c.id}"}] for c in cursos]
-            await send_message(BOT_PROFE_TOKEN, chat_id, "🗂️ Selecciona el Aula Virtual para ingresar:", reply_markup={"inline_keyboard": botones})
+            await send_message(BOT_PROFE_TOKEN, chat_id, "🗂️ Selecciona el Aula Virtual:", reply_markup={"inline_keyboard": botones})
         return {"ok": True}
 
-    # Transmisión segura dentro del grupo
     if telegram_id in profe_grupo_estado:
         c_id = profe_grupo_estado[telegram_id]["curso_id"]
-        if text:
-            await registrar_y_transmitir_en_grupo(db, c_id, telegram_id, nombre, {"text": text}, "text", es_profe=True)
-        elif message.get("document"):
-            await registrar_y_transmitir_en_grupo(db, c_id, telegram_id, nombre, {"file_id": message["document"]["file_id"], "caption": message.get("caption", "")}, "document", es_profe=True)
-        elif message.get("photo"):
-            await registrar_y_transmitir_en_grupo(db, c_id, telegram_id, nombre, {"file_id": message["photo"][-1]["file_id"], "caption": message.get("caption", "")}, "photo", es_profe=True)
-        elif message.get("voice"):
-            await registrar_y_transmitir_en_grupo(db, c_id, telegram_id, nombre, {"file_id": message["voice"]["file_id"]}, "voice", es_profe=True)
-        elif message.get("video"):
-            await registrar_y_transmitir_en_grupo(db, c_id, telegram_id, nombre, {"file_id": message["video"]["file_id"], "caption": message.get("caption", "")}, "video", es_profe=True)
+        if text: await registrar_y_transmitir_en_grupo(db, c_id, telegram_id, nombre, {"text": text}, "text", es_profe=True)
+        elif message.get("document"): await registrar_y_transmitir_en_grupo(db, c_id, telegram_id, nombre, {"file_id": message["document"]["file_id"], "caption": message.get("caption", "")}, "document", es_profe=True)
+        elif message.get("photo"): await registrar_y_transmitir_en_grupo(db, c_id, telegram_id, nombre, {"file_id": message["photo"][-1]["file_id"], "caption": message.get("caption", "")}, "photo", es_profe=True)
+        elif message.get("voice"): await registrar_y_transmitir_en_grupo(db, c_id, telegram_id, nombre, {"file_id": message["voice"]["file_id"]}, "voice", es_profe=True)
+        elif message.get("video"): await registrar_y_transmitir_en_grupo(db, c_id, telegram_id, nombre, {"file_id": message["video"]["file_id"], "caption": message.get("caption", "")}, "video", es_profe=True)
         return {"ok": True}
 
     return {"ok": True}
 
 @app.post("/webhook/estudiante")
 async def webhook_estudiante(request: Request, db: Session = Depends(get_db)):
-    try:
-        data = await request.json()
-    except Exception:
-        return {"ok": True}
+    try: data = await request.json()
+    except Exception: return {"ok": True}
 
     callback = data.get("callback_query", {})
     if callback:
@@ -233,7 +223,8 @@ async def webhook_estudiante(request: Request, db: Session = Depends(get_db)):
         
         if cb_data.startswith("entrar_grupo_"):
             curso_id = cb_data.replace("entrar_grupo_", "")
-            curso = db.query(Curso).filter(Curso.id == curso_id).first()
+            c_uuid = uuid.UUID(curso_id)
+            curso = db.query(Curso).filter(Curso.id == c_uuid).first()
             if curso:
                 estudiante_grupo_estado[telegram_id] = {"curso_id": str(curso_id), "curso_nombre": curso.nombre, "curso_grado": curso.grado}
                 await send_message(BOT_ESTUDIANTE_TOKEN, chat_id, f"📥 Conectado al aula: {curso.nombre}. Escribe /salir para terminar.")
@@ -262,33 +253,31 @@ async def webhook_estudiante(request: Request, db: Session = Depends(get_db)):
 
     if text == "/grupos":
         if estudiante and estudiante.activo:
-            inscripciones = db.query(CursoEstudiante).filter(CursoEstudiante.estudiante_id == estudiante.id).all()
+            # CORRECCIÓN AQUÍ: Conversión explícita a UUID del ID del estudiante
+            e_uuid = uuid.UUID(str(estudiante.id))
+            inscripciones = db.query(CursoEstudiante).filter(CursoEstudiante.estudiante_id == e_uuid).all()
             if inscripciones:
                 botones = []
                 for ins in inscripciones:
                     c = db.query(Curso).filter(Curso.id == ins.curso_id).first()
                     if c: botones.append([{"text": f"📖 Entrar a {c.nombre}", "callback_data": f"entrar_grupo_{c.id}"}])
                 await send_message(BOT_ESTUDIANTE_TOKEN, chat_id, "🔍 Selecciona la asignatura:", reply_markup={"inline_keyboard": botones})
+            else:
+                await send_message(BOT_ESTUDIANTE_TOKEN, chat_id, "No estás inscrito en ningún curso.")
         return {"ok": True}
 
-    # Transmisión segura del estudiante dentro del grupo
     if telegram_id in estudiante_grupo_estado:
         c_id = estudiante_grupo_estado[telegram_id]["curso_id"]
-        if text:
-            await registrar_y_transmitir_en_grupo(db, c_id, telegram_id, nombre, {"text": text}, "text", es_profe=False)
-        elif message.get("document"):
-            await registrar_y_transmitir_en_grupo(db, c_id, telegram_id, nombre, {"file_id": message["document"]["file_id"], "caption": message.get("caption", "")}, "document", es_profe=False)
-        elif message.get("photo"):
-            await registrar_y_transmitir_en_grupo(db, c_id, telegram_id, nombre, {"file_id": message["photo"][-1]["file_id"], "caption": message.get("caption", "")}, "photo", es_profe=False)
-        elif message.get("voice"):
-            await registrar_y_transmitir_en_grupo(db, c_id, telegram_id, nombre, {"file_id": message["voice"]["file_id"]}, "voice", es_profe=False)
-        elif message.get("video"):
-            await registrar_y_transmitir_en_grupo(db, c_id, telegram_id, nombre, {"file_id": message["video"]["file_id"], "caption": message.get("caption", "")}, "video", es_profe=False)
+        if text: await registrar_y_transmitir_en_grupo(db, c_id, telegram_id, nombre, {"text": text}, "text", es_profe=False)
+        elif message.get("document"): await registrar_y_transmitir_en_grupo(db, c_id, telegram_id, nombre, {"file_id": message["document"]["file_id"], "caption": message.get("caption", "")}, "document", es_profe=False)
+        elif message.get("photo"): await registrar_y_transmitir_en_grupo(db, c_id, telegram_id, nombre, {"file_id": message["photo"][-1]["file_id"], "caption": message.get("caption", "")}, "photo", es_profe=False)
+        elif message.get("voice"): await registrar_y_transmitir_en_grupo(db, c_id, telegram_id, nombre, {"file_id": message["voice"]["file_id"]}, "voice", es_profe=False)
+        elif message.get("video"): await registrar_y_transmitir_en_grupo(db, c_id, telegram_id, nombre, {"file_id": message["video"]["file_id"], "caption": message.get("caption", "")}, "video", es_profe=False)
         return {"ok": True}
 
     return {"ok": True}
 
-# --- ENDPOINTS RESTANTES DE CONTROL EXACTAMENTE IGUALES ---
+# --- ENPOINTS DE CONTROL COMPATIBLES CON UUID ---
 @app.post("/profes/registrar")
 def registrar_profe(data: dict, db: Session = Depends(get_db)):
     p = db.query(Profe).filter(Profe.telegram_id == data["telegram_id"]).first()
@@ -329,7 +318,8 @@ def check_estudiante_activo(telegram_id: int, db: Session = Depends(get_db)):
 
 @app.post("/cursos/crear")
 def crear_curso(data: dict, db: Session = Depends(get_db)):
-    nuevo = Curso(id=uuid.uuid4(), profe_id=data["profe_id"], nombre=data["nombre"], grado=data.get("grado", ""))
+    p_uuid = uuid.UUID(data["profe_id"])
+    nuevo = Curso(id=uuid.uuid4(), profe_id=p_uuid, nombre=data["nombre"], grado=data.get("grado", ""))
     db.add(nuevo)
     db.commit()
     return {"id": str(nuevo.id), "nombre": nuevo.nombre, "grado": nuevo.grado}
@@ -342,7 +332,8 @@ def courses_by_profe(telegram_id: int, db: Session = Depends(get_db)):
 
 @app.get("/resultados/historial/{estudiante_id}")
 def historial_estudiante(estudiante_id: str, db: Session = Depends(get_db)):
-    return db.query(Resultado).filter(Resultado.estudiante_id == estudiante_id, Resultado.confirmado == True).all()
+    e_uuid = uuid.UUID(estudiante_id)
+    return db.query(Resultado).filter(Resultado.estudiante_id == e_uuid, Resultado.confirmado == True).all()
 
 @app.post("/admin/activar-profe/{telegram_id}")
 def admin_activar_profe(telegram_id: int, db: Session = Depends(get_db)):
