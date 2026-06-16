@@ -1201,9 +1201,3 @@ def admin_activar_estudiante(telegram_id: int, db: Session = Depends(get_db)):
 def admin_desactivar_estudiante(telegram_id: int, db: Session = Depends(get_db)):
     desactivar_estudiante(telegram_id, db)
     return {"ok": True}
-Por ultimo pega esto en el CDM y enter:
-git add backend\main.py
-git commit -m "envio de archivos imagenes y videos bidireccional"
-git push origin master
-
-
