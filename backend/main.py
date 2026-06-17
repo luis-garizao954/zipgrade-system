@@ -269,7 +269,6 @@ async def send_voice(token, chat_id, file_id, source_token, caption=""):
         print(f"Error enviando nota de voz: {e}")
 
 async def reenviar_archivo(token_destino, chat_id_destino, file_id, token_origen, file_name="archivo", caption="", tipo="document"):
-    """Descarga un archivo del bot origen y lo reenvía con el bot destino"""
     try:
         async with httpx.AsyncClient(timeout=120) as client:
             r = await client.get(f"https://api.telegram.org/bot{token_origen}/getFile",
@@ -291,6 +290,112 @@ async def reenviar_archivo(token_destino, chat_id_destino, file_id, token_origen
                     files={"document": (file_name, file_bytes, "application/octet-stream")})
     except Exception as e:
         print(f"Error reenviando archivo: {e}")
+
+# ─── HELPERS DE GRUPO VIRTUAL ────────────────────────────────────────────────
+# El estado del grupo se guarda en BD con clave __grupo__ID__curso_id
+# Así sobrevive reinicios y no usa RAM compartida.
+
+def get_grupo_activo(db, telegram_id):
+    """Retorna el curso_id del grupo en que está inmerso, o None."""
+    r = db.query(Resultado).filter(
+        Resultado.nombre_temp == f"__grupo__{telegram_id}__curso_id"
+    ).first()
+    return r.quiz_nombre if r else None
+
+def get_grupo_nombre(db, telegram_id):
+    r = db.query(Resultado).filter(
+        Resultado.nombre_temp == f"__grupo__{telegram_id}__curso_nombre"
+    ).first()
+    return r.quiz_nombre if r else ""
+
+def entrar_grupo(db, telegram_id, curso_id, curso_nombre):
+    for clave, valor in [("curso_id", str(curso_id)), ("curso_nombre", curso_nombre)]:
+        r = db.query(Resultado).filter(
+            Resultado.nombre_temp == f"__grupo__{telegram_id}__{clave}"
+        ).first()
+        if r:
+            r.quiz_nombre = valor
+        else:
+            db.add(Resultado(id=uuid.uuid4(),
+                nombre_temp=f"__grupo__{telegram_id}__{clave}",
+                quiz_nombre=valor, confirmado=False))
+    db.commit()
+
+def salir_grupo(db, telegram_id):
+    for clave in ["curso_id", "curso_nombre"]:
+        db.query(Resultado).filter(
+            Resultado.nombre_temp == f"__grupo__{telegram_id}__{clave}"
+        ).delete(synchronize_session=False)
+    db.commit()
+
+async def transmitir_grupo(db, curso_id, remitente_id, remitente_nombre, es_profe,
+                            tipo, file_id=None, text=None, file_name="archivo"):
+    """Envía el mensaje/archivo a todos los miembros del grupo que estén inscritos,
+    excepto al remitente. También llega al profe si está inmerso."""
+    prefijo = f"👨‍🏫 <b>[PROFE] {remitente_nombre}:</b>" if es_profe else f"👥 <b>[GRUPO] {remitente_nombre}:</b>"
+
+    # Obtener estudiantes del curso
+    inscripciones = db.query(CursoEstudiante).filter(
+        CursoEstudiante.curso_id == curso_id
+    ).all()
+
+    destinatarios = []  # (token, chat_id)
+    for ins in inscripciones:
+        est = db.query(Estudiante).filter(Estudiante.id == ins.estudiante_id).first()
+        if est and est.telegram_id != remitente_id:
+            destinatarios.append((BOT_ESTUDIANTE_TOKEN, est.telegram_id))
+
+    # Si el remitente es estudiante, también enviar al profe del curso
+    if not es_profe:
+        curso = db.query(Curso).filter(Curso.id == curso_id).first()
+        if curso:
+            profe_curso = db.query(Profe).filter(Profe.id == curso.profe_id).first()
+            if profe_curso and profe_curso.telegram_id != remitente_id:
+                destinatarios.append((BOT_PROFE_TOKEN, profe_curso.telegram_id))
+
+    for token, chat_id in destinatarios:
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                if tipo == "text":
+                    await client.post(f"https://api.telegram.org/bot{token}/sendMessage",
+                        json={"chat_id": chat_id, "text": f"{prefijo}\n{text}", "parse_mode": "HTML"})
+                elif tipo == "voice":
+                    # Primero enviar aviso de texto, luego el audio
+                    await client.post(f"https://api.telegram.org/bot{token}/sendMessage",
+                        json={"chat_id": chat_id, "text": f"{prefijo}\n🎙️ Nota de voz", "parse_mode": "HTML"})
+                    # Reenviar el audio descargándolo del bot origen
+                    origen_token = BOT_PROFE_TOKEN if es_profe else BOT_ESTUDIANTE_TOKEN
+                    r = await client.get(f"https://api.telegram.org/bot{origen_token}/getFile",
+                        params={"file_id": file_id})
+                    fp = r.json()["result"]["file_path"]
+                    audio_r = await client.get(f"https://api.telegram.org/file/bot{origen_token}/{fp}")
+                    await client.post(f"https://api.telegram.org/bot{token}/sendVoice",
+                        data={"chat_id": chat_id},
+                        files={"voice": ("voice.ogg", audio_r.content, "audio/ogg")})
+                elif tipo in ("photo", "video", "document"):
+                    origen_token = BOT_PROFE_TOKEN if es_profe else BOT_ESTUDIANTE_TOKEN
+                    r = await client.get(f"https://api.telegram.org/bot{origen_token}/getFile",
+                        params={"file_id": file_id})
+                    fp = r.json()["result"]["file_path"]
+                    file_r = await client.get(f"https://api.telegram.org/file/bot{origen_token}/{fp}")
+                    fb = file_r.content
+                    caption = prefijo
+                    if tipo == "photo":
+                        await client.post(f"https://api.telegram.org/bot{token}/sendPhoto",
+                            data={"chat_id": chat_id, "caption": caption, "parse_mode": "HTML"},
+                            files={"photo": (file_name, fb, "image/jpeg")})
+                    elif tipo == "video":
+                        await client.post(f"https://api.telegram.org/bot{token}/sendVideo",
+                            data={"chat_id": chat_id, "caption": caption, "parse_mode": "HTML"},
+                            files={"video": (file_name, fb, "video/mp4")})
+                    else:
+                        await client.post(f"https://api.telegram.org/bot{token}/sendDocument",
+                            data={"chat_id": chat_id, "caption": caption, "parse_mode": "HTML"},
+                            files={"document": (file_name, fb, "application/octet-stream")})
+        except Exception as e:
+            print(f"Error transmitiendo a {chat_id}: {e}")
+
+# ─────────────────────────────────────────────────────────────────────────────
 
 def sesion_activa(db, telegram_id):
     r = db.query(Resultado).filter(
@@ -361,7 +466,32 @@ async def webhook_profe(request: Request, db: Session = Depends(get_db)):
         telegram_id = chat_id
         cb_data = callback.get("data", "")
 
-        if cb_data.startswith("curso_"):
+        if cb_data.startswith("grupo_profe_"):
+            curso_id = cb_data.replace("grupo_profe_", "")
+            curso = db.query(Curso).filter(Curso.id == curso_id).first()
+            if curso:
+                entrar_grupo(db, telegram_id, curso_id, f"{curso.nombre} {curso.grado}")
+                await send_message(BOT_PROFE_TOKEN, chat_id,
+                    f"🏫 <b>Estás en el grupo: {curso.nombre} {curso.grado}</b>\n\n"
+                    f"Todo lo que escribas o envíes (texto, voz, imágenes, PDF, video) "
+                    f"llegará a todos los estudiantes inscritos.\n\n"
+                    f"Usa /salir_grupo para volver a tu chat normal.")
+                # Notificar a estudiantes que el profe entró
+                inscripciones = db.query(CursoEstudiante).filter(
+                    CursoEstudiante.curso_id == curso_id
+                ).all()
+                profe_nombre = callback.get("from", {}).get("first_name", "El profe")
+                for ins in inscripciones:
+                    est = db.query(Estudiante).filter(Estudiante.id == ins.estudiante_id).first()
+                    if est:
+                        try:
+                            await send_message(BOT_ESTUDIANTE_TOKEN, est.telegram_id,
+                                f"🔔 <b>El profe {profe_nombre} se unió al grupo de {curso.nombre} {curso.grado}</b>\n\n"
+                                f"Usa /grupos para entrar y ver lo que comparte.")
+                        except:
+                            pass
+
+        elif cb_data.startswith("curso_"):
             curso_id = cb_data.replace("curso_", "")
             curso = db.query(Curso).filter(Curso.id == curso_id).first()
             if curso:
@@ -429,7 +559,64 @@ async def webhook_profe(request: Request, db: Session = Depends(get_db)):
 
     profe = db.query(Profe).filter(Profe.telegram_id == telegram_id).first()
 
-    # NOTA DE VOZ DEL PROFE → reenviar al estudiante
+    # ── MODO GRUPO ACTIVO DEL PROFE ──────────────────────────────────────────
+    grupo_activo = get_grupo_activo(db, telegram_id)
+    if grupo_activo and text != "/salir_grupo" and text != "/grupos":
+        grupo_nombre = get_grupo_nombre(db, telegram_id)
+
+        if voice:
+            voice_file_id = voice.get("file_id")
+            # Verificar primero si es respuesta individual
+            paso = get_estado(db, telegram_id, "paso")
+            if paso and paso.startswith("responder_voz_"):
+                try:
+                    estudiante_dest = int(paso.replace("responder_voz_", ""))
+                    del_estado(db, telegram_id, "paso")
+                    await send_voice(BOT_ESTUDIANTE_TOKEN, estudiante_dest, voice_file_id, BOT_PROFE_TOKEN,
+                        "🎙️ Nota de voz de tu profe")
+                    await send_message(BOT_PROFE_TOKEN, chat_id, "✅ Nota de voz enviada al estudiante.")
+                except Exception as e:
+                    await send_message(BOT_PROFE_TOKEN, chat_id, f"❌ Error: {str(e)}")
+            else:
+                await transmitir_grupo(db, grupo_activo, telegram_id, nombre, True,
+                    "voice", file_id=voice_file_id)
+                await send_message(BOT_PROFE_TOKEN, chat_id,
+                    f"🎙️ Nota de voz enviada al grupo <b>{grupo_nombre}</b>.")
+            return {"ok": True}
+
+        if photo:
+            fid = photo[-1].get("file_id")
+            await transmitir_grupo(db, grupo_activo, telegram_id, nombre, True,
+                "photo", file_id=fid, file_name="imagen.jpg")
+            await send_message(BOT_PROFE_TOKEN, chat_id,
+                f"🖼️ Imagen enviada al grupo <b>{grupo_nombre}</b>.")
+            return {"ok": True}
+
+        if video:
+            fid = video.get("file_id")
+            fname = video.get("file_name", "video.mp4")
+            await transmitir_grupo(db, grupo_activo, telegram_id, nombre, True,
+                "video", file_id=fid, file_name=fname)
+            await send_message(BOT_PROFE_TOKEN, chat_id,
+                f"🎥 Video enviado al grupo <b>{grupo_nombre}</b>.")
+            return {"ok": True}
+
+        if document:
+            fid = document.get("file_id")
+            fname = document.get("file_name", "archivo")
+            await transmitir_grupo(db, grupo_activo, telegram_id, nombre, True,
+                "document", file_id=fid, file_name=fname)
+            await send_message(BOT_PROFE_TOKEN, chat_id,
+                f"📎 Archivo enviado al grupo <b>{grupo_nombre}</b>.")
+            return {"ok": True}
+
+        if text and not text.startswith("/"):
+            await transmitir_grupo(db, grupo_activo, telegram_id, nombre, True,
+                "text", text=text)
+            return {"ok": True}
+    # ─────────────────────────────────────────────────────────────────────────
+
+    # NOTA DE VOZ fuera de grupo (respuesta individual)
     if voice:
         voice_file_id = voice.get("file_id")
         paso = get_estado(db, telegram_id, "paso")
@@ -447,11 +634,10 @@ async def webhook_profe(request: Request, db: Session = Depends(get_db)):
                 "❌ Primero usa <code>/responder_voz ID_ESTUDIANTE</code> y luego envía la nota de voz.")
         return {"ok": True}
 
-    # ARCHIVO/IMAGEN/VIDEO DEL PROFE → enviar a curso o estudiante individual
+    # ARCHIVO/IMAGEN/VIDEO fuera de grupo
     archivo_recibido = None
     archivo_tipo = None
     archivo_nombre = "archivo"
-
     if photo:
         archivo_recibido = photo[-1].get("file_id")
         archivo_tipo = "photo"
@@ -467,8 +653,6 @@ async def webhook_profe(request: Request, db: Session = Depends(get_db)):
 
     if archivo_recibido:
         paso = get_estado(db, telegram_id, "paso")
-
-        # Archivo para enviar a todo un curso
         if paso == "esperando_archivo_para_curso":
             curso_info = get_estado(db, telegram_id, "enviar_archivo_curso")
             if curso_info:
@@ -496,7 +680,6 @@ async def webhook_profe(request: Request, db: Session = Depends(get_db)):
                         f"✅ Archivo enviado a <b>{enviados} estudiantes</b> del curso <b>{curso_nombre}</b>.")
             return {"ok": True}
 
-        # Archivo para enviar a estudiante individual
         elif paso and paso.startswith("enviar_archivo_estudiante_"):
             estudiante_dest = int(paso.replace("enviar_archivo_estudiante_", ""))
             del_estado(db, telegram_id, "paso")
@@ -509,7 +692,6 @@ async def webhook_profe(request: Request, db: Session = Depends(get_db)):
                 await send_message(BOT_PROFE_TOKEN, chat_id, f"❌ Error enviando archivo: {str(e)}")
             return {"ok": True}
 
-        # Si es PDF de ZipGrade (flujo normal)
         elif archivo_tipo == "document" and archivo_nombre.endswith(".pdf"):
             paso_actual = get_estado(db, telegram_id, "paso")
             curso_info = get_estado(db, telegram_id, "curso_seleccionado")
@@ -584,7 +766,6 @@ async def webhook_profe(request: Request, db: Session = Depends(get_db)):
             return {"ok": True}
 
         else:
-            # Archivo recibido sin contexto — preguntar a dónde enviarlo
             cursos = db.query(Curso).filter(Curso.profe_id == profe.id).all() if profe else []
             if cursos:
                 set_estado(db, telegram_id, "archivo_pendiente_id", archivo_recibido)
@@ -620,13 +801,39 @@ async def webhook_profe(request: Request, db: Session = Depends(get_db)):
                     f"/excel - Generar Excel de notas\n"
                     f"/estadisticas - Ver grafico del grupo\n"
                     f"/enviar - Enviar archivo a un curso\n"
+                    f"/grupos - Entrar a un grupo virtual\n"
                     f"/estado - Ver suscripcion\n\n"
-                    f"💬 Para responder a un estudiante:\n"
+                    f"💬 Para responder individualmente:\n"
                     f"• Texto: <code>/responder ID mensaje</code>\n"
                     f"• Voz: <code>/responder_voz ID</code> y luego graba\n"
-                    f"• Archivo: <code>/enviar_a ID</code> y luego envía el archivo")
+                    f"• Archivo: <code>/enviar_a ID</code> y luego envía")
             else:
                 await send_message(BOT_PROFE_TOKEN, chat_id, "❌ Tu suscripcion no esta activa.")
+
+    elif text == "/grupos":
+        if not profe or not profe.activo:
+            await send_message(BOT_PROFE_TOKEN, chat_id, "❌ Necesitas suscripcion activa.")
+            return {"ok": True}
+        cursos = db.query(Curso).filter(Curso.profe_id == profe.id).all()
+        if not cursos:
+            await send_message(BOT_PROFE_TOKEN, chat_id, "No tienes cursos. Usa /nuevocurso para crear uno.")
+        else:
+            grupo_actual = get_grupo_activo(db, telegram_id)
+            grupo_nombre_actual = get_grupo_nombre(db, telegram_id)
+            msg = "🏫 <b>Grupos virtuales</b>\n\nSelecciona el grupo al que quieres entrar:"
+            if grupo_actual:
+                msg = f"🏫 Actualmente estás en: <b>{grupo_nombre_actual}</b>\n\nUsa /salir_grupo para salir o cambia de grupo:"
+            botones = {"inline_keyboard": [[{
+                "text": f"🏫 {c.nombre} - {c.grado}",
+                "callback_data": f"grupo_profe_{c.id}"
+            }] for c in cursos]}
+            await send_message(BOT_PROFE_TOKEN, chat_id, msg, reply_markup=botones)
+
+    elif text == "/salir_grupo":
+        grupo_nombre_actual = get_grupo_nombre(db, telegram_id)
+        salir_grupo(db, telegram_id)
+        await send_message(BOT_PROFE_TOKEN, chat_id,
+            f"✅ Saliste del grupo <b>{grupo_nombre_actual}</b>.\n\nVolviste a tu chat normal de profesor.")
 
     elif text == "/estado":
         if profe:
@@ -676,8 +883,7 @@ async def webhook_profe(request: Request, db: Session = Depends(get_db)):
                 "callback_data": f"enviar_curso_{c.id}"
             }] for c in cursos]}
             await send_message(BOT_PROFE_TOKEN, chat_id,
-                "📤 ¿A qué curso quieres enviar el archivo?\n\n"
-                "Después de seleccionar el curso, envía el archivo, imagen o video.",
+                "📤 ¿A qué curso quieres enviar el archivo?\n\nDespués de seleccionar, envía el archivo.",
                 reply_markup=botones)
 
     elif text and text.startswith("/enviar_a"):
@@ -687,7 +893,7 @@ async def webhook_profe(request: Request, db: Session = Depends(get_db)):
                 estudiante_id = int(partes[1].strip())
                 set_estado(db, telegram_id, "paso", f"enviar_archivo_estudiante_{estudiante_id}")
                 await send_message(BOT_PROFE_TOKEN, chat_id,
-                    f"📤 Listo. Ahora envía el archivo, imagen o video para el estudiante <code>{estudiante_id}</code>.")
+                    f"📤 Listo. Ahora envía el archivo para el estudiante <code>{estudiante_id}</code>.")
             except:
                 await send_message(BOT_PROFE_TOKEN, chat_id,
                     "❌ Formato incorrecto.\nUsa: <code>/enviar_a ID_ESTUDIANTE</code>")
@@ -842,7 +1048,7 @@ async def webhook_profe(request: Request, db: Session = Depends(get_db)):
 
         else:
             await send_message(BOT_PROFE_TOKEN, chat_id,
-                "Comandos:\n/start\n/micursos\n/nuevocurso\n/subirquiz\n/excel\n/estadisticas\n/enviar\n/estado")
+                "Comandos:\n/start\n/micursos\n/nuevocurso\n/subirquiz\n/excel\n/estadisticas\n/enviar\n/grupos\n/estado")
 
     return {"ok": True}
 
@@ -857,7 +1063,17 @@ async def webhook_estudiante(request: Request, db: Session = Depends(get_db)):
         telegram_id = chat_id
         cb_data = callback.get("data", "")
 
-        if cb_data.startswith("duda_materia_"):
+        if cb_data.startswith("grupo_est_"):
+            curso_id = cb_data.replace("grupo_est_", "")
+            curso = db.query(Curso).filter(Curso.id == curso_id).first()
+            if curso:
+                entrar_grupo(db, telegram_id, curso_id, f"{curso.nombre} {curso.grado}")
+                await send_message(BOT_ESTUDIANTE_TOKEN, chat_id,
+                    f"🏫 <b>Entraste al grupo: {curso.nombre} {curso.grado}</b>\n\n"
+                    f"Todo lo que escribas o envíes llegará a tus compañeros y al profe.\n\n"
+                    f"Usa /salir_grupo para volver a tu chat personal.")
+
+        elif cb_data.startswith("duda_materia_"):
             partes = cb_data.replace("duda_materia_", "").split("|", 1)
             materia = partes[0]
             profe_tid = int(partes[1]) if len(partes) > 1 else PROFE_CHAT_ID
@@ -867,7 +1083,7 @@ async def webhook_estudiante(request: Request, db: Session = Depends(get_db)):
             set_estado(db, telegram_id, "sesion_inicio", datetime.now().isoformat())
             await send_message(BOT_ESTUDIANTE_TOKEN, chat_id,
                 f"📚 Materia: <b>{materia}</b>\n\n"
-                f"✏️ Puedes enviar mensajes de texto, notas de voz 🎙️, archivos 📎, imágenes 🖼️ y videos 🎥 libremente durante 15 minutos.\n\n"
+                f"✏️ Puedes enviar mensajes, notas de voz 🎙️, archivos 📎 e imágenes 🖼️ durante 15 minutos.\n\n"
                 f"La sesion se cerrara automaticamente.")
         return {"ok": True}
 
@@ -885,7 +1101,49 @@ async def webhook_estudiante(request: Request, db: Session = Depends(get_db)):
 
     estudiante = db.query(Estudiante).filter(Estudiante.telegram_id == telegram_id).first()
 
-    # NOTA DE VOZ DEL ESTUDIANTE
+    # ── MODO GRUPO ACTIVO DEL ESTUDIANTE ─────────────────────────────────────
+    grupo_activo = get_grupo_activo(db, telegram_id)
+    if grupo_activo and text != "/salir_grupo" and text != "/grupos" and text != "/duda" and text != "/grafico":
+        grupo_nombre = get_grupo_nombre(db, telegram_id)
+        nombre_est = estudiante.nombre if estudiante else nombre
+
+        if voice:
+            await transmitir_grupo(db, grupo_activo, telegram_id, nombre_est, False,
+                "voice", file_id=voice.get("file_id"))
+            await send_message(BOT_ESTUDIANTE_TOKEN, chat_id,
+                f"🎙️ Nota de voz enviada al grupo <b>{grupo_nombre}</b>.")
+            return {"ok": True}
+
+        if photo:
+            await transmitir_grupo(db, grupo_activo, telegram_id, nombre_est, False,
+                "photo", file_id=photo[-1].get("file_id"), file_name="imagen.jpg")
+            await send_message(BOT_ESTUDIANTE_TOKEN, chat_id,
+                f"🖼️ Imagen enviada al grupo <b>{grupo_nombre}</b>.")
+            return {"ok": True}
+
+        if video:
+            fname = video.get("file_name", "video.mp4")
+            await transmitir_grupo(db, grupo_activo, telegram_id, nombre_est, False,
+                "video", file_id=video.get("file_id"), file_name=fname)
+            await send_message(BOT_ESTUDIANTE_TOKEN, chat_id,
+                f"🎥 Video enviado al grupo <b>{grupo_nombre}</b>.")
+            return {"ok": True}
+
+        if document:
+            fname = document.get("file_name", "archivo")
+            await transmitir_grupo(db, grupo_activo, telegram_id, nombre_est, False,
+                "document", file_id=document.get("file_id"), file_name=fname)
+            await send_message(BOT_ESTUDIANTE_TOKEN, chat_id,
+                f"📎 Archivo enviado al grupo <b>{grupo_nombre}</b>.")
+            return {"ok": True}
+
+        if text and not text.startswith("/"):
+            await transmitir_grupo(db, grupo_activo, telegram_id, nombre_est, False,
+                "text", text=text)
+            return {"ok": True}
+    # ─────────────────────────────────────────────────────────────────────────
+
+    # NOTA DE VOZ fuera de grupo (sesión de duda)
     if voice:
         esperando = get_estado(db, telegram_id, "esperando_duda")
         if esperando == "si" and sesion_activa(db, telegram_id):
@@ -914,11 +1172,10 @@ async def webhook_estudiante(request: Request, db: Session = Depends(get_db)):
                 "❌ Primero usa /duda para iniciar una consulta con tu profe.")
         return {"ok": True}
 
-    # ARCHIVO / IMAGEN / VIDEO DEL ESTUDIANTE → enviar al profe
+    # ARCHIVO fuera de grupo (sesión de duda)
     archivo_recibido = None
     archivo_tipo = None
     archivo_nombre = "archivo"
-
     if photo:
         archivo_recibido = photo[-1].get("file_id")
         archivo_tipo = "photo"
@@ -969,11 +1226,84 @@ async def webhook_estudiante(request: Request, db: Session = Depends(get_db)):
                 f"Puedes:\n• Escribir tu <b>nombre</b> para ver todas tus notas\n"
                 f"• Escribir una <b>materia</b> para ver notas de esa materia\n"
                 f"• Usar /grafico para ver tu grafico de rendimiento\n"
-                f"• Usar /duda para contactar a tu profe (texto, voz 🎙️, archivos 📎, imágenes 🖼️, videos 🎥)")
+                f"• Usar /grupos para entrar al chat grupal de una asignatura\n"
+                f"• Usar /duda para contactar a tu profe en privado")
         else:
             await send_message(BOT_ESTUDIANTE_TOKEN, chat_id,
                 f"✅ Hola <b>{estudiante.nombre}</b>!\n\n"
-                f"Comandos:\n/grafico - Ver tu grafico de rendimiento\n/duda - Contactar al profe")
+                f"Comandos:\n/grafico - Ver tu grafico de rendimiento\n"
+                f"/grupos - Entrar al chat grupal\n"
+                f"/duda - Contactar al profe en privado")
+
+    elif text == "/grupos":
+        # Buscar cursos donde el estudiante tiene resultados registrados
+        est = db.query(Estudiante).filter(Estudiante.telegram_id == telegram_id).first()
+        if not est or not est.nombre:
+            await send_message(BOT_ESTUDIANTE_TOKEN, chat_id,
+                "❌ Primero escribe tu nombre completo para registrarte.")
+            return {"ok": True}
+
+        # Buscar cursos disponibles basado en resultados del estudiante
+        cursos_data = db.query(Resultado.curso_nombre, Resultado.profe_telegram_id).filter(
+            Resultado.nombre_temp.ilike(f"%{est.nombre}%"),
+            Resultado.confirmado == True,
+            Resultado.curso_nombre != None
+        ).distinct().all()
+
+        if not cursos_data:
+            await send_message(BOT_ESTUDIANTE_TOKEN, chat_id,
+                "❌ No tienes materias registradas aun. Escribe tu nombre primero.")
+            return {"ok": True}
+
+        # Obtener los objetos Curso correspondientes
+        botones_grupos = []
+        for cd in cursos_data:
+            curso_nombre = cd[0]
+            # Buscar el curso por nombre y profe
+            resultado_sample = db.query(Resultado).filter(
+                Resultado.curso_nombre == curso_nombre,
+                Resultado.nombre_temp.ilike(f"%{est.nombre}%"),
+                Resultado.confirmado == True
+            ).first()
+            if resultado_sample and resultado_sample.profe_telegram_id:
+                profe_obj = db.query(Profe).filter(
+                    Profe.telegram_id == resultado_sample.profe_telegram_id
+                ).first()
+                if profe_obj:
+                    curso_obj = db.query(Curso).filter(
+                        Curso.profe_id == profe_obj.id,
+                        Curso.nombre == curso_nombre
+                    ).first()
+                    if curso_obj:
+                        botones_grupos.append([{
+                            "text": f"🏫 {curso_nombre} - {curso_obj.grado}",
+                            "callback_data": f"grupo_est_{curso_obj.id}"
+                        }])
+
+        grupo_actual = get_grupo_activo(db, telegram_id)
+        grupo_nombre_actual = get_grupo_nombre(db, telegram_id)
+
+        if not botones_grupos:
+            await send_message(BOT_ESTUDIANTE_TOKEN, chat_id,
+                "❌ No encontré grupos disponibles. Asegúrate de que tus cursos estén configurados.")
+            return {"ok": True}
+
+        msg = "🏫 <b>Grupos virtuales</b>\n\nSelecciona el grupo al que quieres entrar:"
+        if grupo_actual:
+            msg = (f"🏫 Actualmente estás en: <b>{grupo_nombre_actual}</b>\n\n"
+                   f"Usa /salir_grupo para salir o cambia de grupo:")
+        await send_message(BOT_ESTUDIANTE_TOKEN, chat_id, msg,
+            reply_markup={"inline_keyboard": botones_grupos})
+
+    elif text == "/salir_grupo":
+        grupo_nombre_actual = get_grupo_nombre(db, telegram_id)
+        if grupo_nombre_actual:
+            salir_grupo(db, telegram_id)
+            await send_message(BOT_ESTUDIANTE_TOKEN, chat_id,
+                f"✅ Saliste del grupo <b>{grupo_nombre_actual}</b>.\n\nVolviste a tu chat personal.")
+        else:
+            await send_message(BOT_ESTUDIANTE_TOKEN, chat_id,
+                "No estás en ningún grupo actualmente.")
 
     elif text == "/duda":
         est = db.query(Estudiante).filter(Estudiante.telegram_id == telegram_id).first()
@@ -1098,7 +1428,7 @@ async def webhook_estudiante(request: Request, db: Session = Depends(get_db)):
                     quiz = r.quiz_nombre or "Sin quiz"
                     msg += f"📚 <b>{curso}</b> - {quiz}: <b>{r.nota}/5.0</b> ({r.porcentaje}%)\n"
                 await send_message(BOT_ESTUDIANTE_TOKEN, chat_id, msg)
-                for r in resultados_nombre:     
+                for r in resultados_nombre:
                     if r.imagen_url:
                         await send_photo(BOT_ESTUDIANTE_TOKEN, chat_id, r.imagen_url,
                             f"📋 {r.curso_nombre} - {r.quiz_nombre}")
