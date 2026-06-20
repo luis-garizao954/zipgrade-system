@@ -1010,7 +1010,12 @@ async def webhook_profe(request: Request, db: Session = Depends(get_db)):
             estudiante_tid, curso_id_ind = chat_ind
             await borrar_chat_individual(db, BOT_PROFE_TOKEN, telegram_id, BOT_ESTUDIANTE_TOKEN, estudiante_tid)
             salir_chat_individual(db, telegram_id)
-            await send_message(BOT_PROFE_TOKEN, chat_id, "✅ Volviste al grupo.")
+            curso_volver = db.query(Curso).filter(Curso.id == curso_id_ind).first()
+            nombre_curso_volver = f"{curso_volver.nombre} {curso_volver.grado}" if curso_volver else "el grupo"
+            mid = await send_message(BOT_PROFE_TOKEN, chat_id,
+                f"✅ <b>Volviste al grupo: {nombre_curso_volver}</b>")
+            registrar_msg_grupo(db, chat_id, curso_id_ind, mid)
+            await mostrar_historial_grupo(db, BOT_PROFE_TOKEN, chat_id, curso_id_ind)
         else:
             await send_message(BOT_PROFE_TOKEN, chat_id, "No estás en ningún chat individual.")
         return {"ok": True}
