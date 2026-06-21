@@ -375,19 +375,27 @@ async def borrar_mensajes_grupo_usuario(db, token, telegram_id, curso_id):
 # transmisión al grupo mientras dura el chat individual.
  
 def get_chat_individual(db, profe_telegram_id):
-    """Retorna (estudiante_tid, curso_id) si el profe está en un chat individual, o None."""
+    """Retorna (estudiante_tid, curso_id, desde_cuando) si el profe está en un chat individual, o None."""
     r = db.query(Resultado).filter(Resultado.nombre_temp == f"__chat_individual__{profe_telegram_id}").first()
     if r and r.quiz_nombre:
         try:
-            estudiante_tid, curso_id = r.quiz_nombre.split("|", 1)
-            return int(estudiante_tid), curso_id
+            partes = r.quiz_nombre.split("|", 2)
+            estudiante_tid = int(partes[0])
+            curso_id = partes[1]
+            desde_cuando = None
+            if len(partes) > 2 and partes[2]:
+                try:
+                    desde_cuando = datetime.fromisoformat(partes[2])
+                except:
+                    desde_cuando = None
+            return estudiante_tid, curso_id, desde_cuando
         except:
             return None
     return None
  
 def entrar_chat_individual(db, profe_telegram_id, estudiante_tid, curso_id):
     clave = f"__chat_individual__{profe_telegram_id}"
-    valor = f"{estudiante_tid}|{curso_id}"
+    valor = f"{estudiante_tid}|{curso_id}|{datetime.now().isoformat()}"
     r = db.query(Resultado).filter(Resultado.nombre_temp == clave).first()
     if r:
         r.quiz_nombre = valor
@@ -709,22 +717,25 @@ async def transmitir_grupo(db, curso_id, remitente_id, remitente_nombre, es_prof
             except Exception as e:
                 print(f"[transmitir_grupo] EXCEPTION -> {chat_id}: {e}")
  
-async def mostrar_historial_grupo(db, token, chat_id, curso_id):
+async def mostrar_historial_grupo(db, token, chat_id, curso_id, desde_cuando=None):
     """
-    Muestra el historial COMPLETO del grupo (todos los mensajes desde el inicio)
-    y registra cada message_id que llega a este usuario, para poder borrarlo
-    la próxima vez que salga del grupo (incluyendo sus propios mensajes pasados,
-    que ya están registrados desde que los envió).
+    Muestra el historial del grupo y registra cada message_id que llega a este
+    usuario, para poder borrarlo después.
+    - Si desde_cuando es None: muestra el historial COMPLETO (todos los mensajes).
+    - Si desde_cuando tiene valor: muestra solo los mensajes posteriores a esa fecha
+      (usado al volver de un chat individual, donde el historial previo ya está
+      visible en pantalla y no debe repetirse).
     """
-    mensajes = db.query(GrupoMensaje).filter(
-        GrupoMensaje.curso_id == str(curso_id)
-    ).order_by(GrupoMensaje.created_at.asc()).all()
+    query = db.query(GrupoMensaje).filter(GrupoMensaje.curso_id == str(curso_id))
+    if desde_cuando:
+        query = query.filter(GrupoMensaje.created_at > desde_cuando)
+    mensajes = query.order_by(GrupoMensaje.created_at.asc()).all()
  
     if not mensajes:
         return
  
-    mid = await send_message(token, chat_id,
-        f"📜 <b>Historial del grupo ({len(mensajes)} mensajes):</b>\n" + "─" * 30)
+    titulo = f"📜 <b>Mensajes nuevos del grupo ({len(mensajes)}):</b>\n" + "─" * 30 if desde_cuando else f"📜 <b>Historial del grupo ({len(mensajes)} mensajes):</b>\n" + "─" * 30
+    mid = await send_message(token, chat_id, titulo)
     registrar_msg_grupo(db, chat_id, str(curso_id), mid)
  
     for m in mensajes:
@@ -986,7 +997,9 @@ async def webhook_profe(request: Request, db: Session = Depends(get_db)):
     # ── CHAT INDIVIDUAL ACTIVO (tiene prioridad sobre el grupo) ──────────────
     chat_ind = get_chat_individual(db, telegram_id)
     if chat_ind and text != "/volver_grupo":
-        estudiante_tid, curso_id_ind = chat_ind
+        estudiante_tid, curso_id_ind, _desde = chat_ind
+        if incoming_msg_id:
+            registrar_msg_chat_individual(db, telegram_id, estudiante_tid, incoming_msg_id)
         if voice:
             await enviar_chat_individual(db, telegram_id, estudiante_tid, "voice", file_id=voice.get("file_id"))
             return {"ok": True}
@@ -1007,7 +1020,7 @@ async def webhook_profe(request: Request, db: Session = Depends(get_db)):
  
     elif text == "/volver_grupo":
         if chat_ind:
-            estudiante_tid, curso_id_ind = chat_ind
+            estudiante_tid, curso_id_ind, desde_cuando_ind = chat_ind
             await borrar_chat_individual(db, BOT_PROFE_TOKEN, telegram_id, BOT_ESTUDIANTE_TOKEN, estudiante_tid)
             salir_chat_individual(db, telegram_id)
             curso_volver = db.query(Curso).filter(Curso.id == curso_id_ind).first()
@@ -1015,7 +1028,7 @@ async def webhook_profe(request: Request, db: Session = Depends(get_db)):
             mid = await send_message(BOT_PROFE_TOKEN, chat_id,
                 f"✅ <b>Volviste al grupo: {nombre_curso_volver}</b>")
             registrar_msg_grupo(db, chat_id, curso_id_ind, mid)
-            await mostrar_historial_grupo(db, BOT_PROFE_TOKEN, chat_id, curso_id_ind)
+            await mostrar_historial_grupo(db, BOT_PROFE_TOKEN, chat_id, curso_id_ind, desde_cuando=desde_cuando_ind)
         else:
             await send_message(BOT_PROFE_TOKEN, chat_id, "No estás en ningún chat individual.")
         return {"ok": True}
