@@ -1084,9 +1084,14 @@ async def webhook_profe(request: Request, db: Session = Depends(get_db)):
         if document:
             fid = document.get("file_id")
             fname = document.get("file_name", "archivo")
-            await transmitir_grupo(db, grupo_activo, telegram_id, nombre, True, "document",
-                file_id=fid, file_name=fname, remitente_msg_id=incoming_msg_id)
-            return {"ok": True}
+            paso_actual = get_estado(db, telegram_id, "paso")
+            pasos_flujo = ["esperando_pdf_zipgrade", "esperando_pdf_quiz", "esperando_archivo_para_curso"]
+            if paso_actual and paso_actual in pasos_flujo:
+                pass  # dejar caer al handler normal de archivos
+            else:
+                await transmitir_grupo(db, grupo_activo, telegram_id, nombre, True, "document",
+                    file_id=fid, file_name=fname, remitente_msg_id=incoming_msg_id)
+                return {"ok": True}
         if text and not text.startswith("/"):
             paso_actual = get_estado(db, telegram_id, "paso")
             pasos_flujo = ["esperando_nombre_curso", "esperando_nombre_quiz", "esperando_pdf_zipgrade",
