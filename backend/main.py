@@ -2216,3 +2216,4 @@ def admin_activar_estudiante(telegram_id: int, db: Session = Depends(get_db)):
 def admin_desactivar_estudiante(telegram_id: int, db: Session = Depends(get_db)):
     desactivar_estudiante(telegram_id, db)
     return {"ok": True}
+ 
