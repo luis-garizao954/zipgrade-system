@@ -21,12 +21,6 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 import numpy as np
 from datetime import datetime, timedelta
-from reportlab.lib.pagesizes import A4
-from reportlab.lib import colors
-from reportlab.lib.units import cm
-from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.lib.enums import TA_CENTER, TA_LEFT
  
 app = FastAPI(title="ZipGrade System API", version="1.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -240,148 +234,6 @@ def generar_excel(resultados, titulo):
     buffer.seek(0)
     return buffer.getvalue()
  
-def generar_pdf_notas(resultados, titulo):
-    buffer = io.BytesIO()
-    doc = SimpleDocTemplate(buffer, pagesize=A4,
-        rightMargin=1.5*cm, leftMargin=1.5*cm,
-        topMargin=2*cm, bottomMargin=2*cm)
- 
-    styles = getSampleStyleSheet()
-    estilo_titulo = ParagraphStyle('titulo',
-        parent=styles['Title'], fontSize=16, textColor=colors.HexColor('#1F4E79'),
-        spaceAfter=6, alignment=TA_CENTER, fontName='Helvetica-Bold')
-    estilo_subtitulo = ParagraphStyle('subtitulo',
-        parent=styles['Normal'], fontSize=10, textColor=colors.HexColor('#2E74B5'),
-        spaceAfter=12, alignment=TA_CENTER, fontName='Helvetica')
-    estilo_footer = ParagraphStyle('footer',
-        parent=styles['Normal'], fontSize=8, textColor=colors.grey,
-        alignment=TA_CENTER, fontName='Helvetica')
- 
-    elementos = []
- 
-    # Título
-    elementos.append(Paragraph(titulo, estilo_titulo))
-    fecha = datetime.now().strftime("%d/%m/%Y %H:%M")
-    elementos.append(Paragraph(f"Generado el {fecha}", estilo_subtitulo))
-    elementos.append(Spacer(1, 0.3*cm))
- 
-    # Tabla
-    encabezados = ['#', 'Estudiante', 'Nota', 'Porcentaje', 'Estado']
-    filas = [encabezados]
- 
-    total = len(resultados)
-    suma_notas = 0
-    aprobados = 0
- 
-    for i, r in enumerate(resultados, 1):
-        nota = float(r.nota) if r.nota else 0
-        porcentaje = float(r.porcentaje) if r.porcentaje else 0
-        suma_notas += nota
-        if nota >= 3.0:
-            aprobados += 1
-        estado = "✓ Aprobado" if nota >= 3.0 else "✗ Reprobado"
-        filas.append([
-            str(i),
-            r.nombre_temp or "",
-            f"{nota:.2f} / 5.0",
-            f"{porcentaje:.1f}%",
-            estado
-        ])
- 
-    # Fila de promedio
-    promedio = suma_notas / total if total > 0 else 0
-    filas.append(['', 'PROMEDIO DEL GRUPO', f"{promedio:.2f} / 5.0",
-                  f"{(promedio/5.0*100):.1f}%", f"{aprobados}/{total} aprobados"])
- 
-    # Anchos de columna
-    col_widths = [1.0*cm, 7.0*cm, 2.8*cm, 2.5*cm, 3.0*cm]
- 
-    tabla = Table(filas, colWidths=col_widths, repeatRows=1)
- 
-    # Estilo base
-    estilo_tabla = TableStyle([
-        # Encabezado
-        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#1F4E79')),
-        ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
-        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-        ('FONTSIZE', (0, 0), (-1, 0), 10),
-        ('ALIGN', (0, 0), (-1, 0), 'CENTER'),
-        ('VALIGN', (0, 0), (-1, 0), 'MIDDLE'),
-        ('BOTTOMPADDING', (0, 0), (-1, 0), 8),
-        ('TOPPADDING', (0, 0), (-1, 0), 8),
-        # Cuerpo
-        ('FONTNAME', (0, 1), (-1, -2), 'Helvetica'),
-        ('FONTSIZE', (0, 1), (-1, -2), 9),
-        ('ALIGN', (0, 1), (0, -1), 'CENTER'),
-        ('ALIGN', (2, 1), (-1, -1), 'CENTER'),
-        ('ALIGN', (1, 1), (1, -1), 'LEFT'),
-        ('VALIGN', (0, 1), (-1, -1), 'MIDDLE'),
-        ('TOPPADDING', (0, 1), (-1, -1), 5),
-        ('BOTTOMPADDING', (0, 1), (-1, -1), 5),
-        # Fila de promedio (última)
-        ('BACKGROUND', (0, -1), (-1, -1), colors.HexColor('#2E74B5')),
-        ('TEXTCOLOR', (0, -1), (-1, -1), colors.white),
-        ('FONTNAME', (0, -1), (-1, -1), 'Helvetica-Bold'),
-        ('FONTSIZE', (0, -1), (-1, -1), 9),
-        # Bordes
-        ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#BDD7EE')),
-        ('LINEBELOW', (0, 0), (-1, 0), 1.5, colors.HexColor('#1F4E79')),
-    ])
- 
-    # Colorear filas según nota
-    for i, r in enumerate(resultados, 1):
-        nota = float(r.nota) if r.nota else 0
-        if nota >= 3.5:
-            bg = colors.HexColor('#C6EFCE')
-            fg = colors.HexColor('#276221')
-        elif nota >= 3.0:
-            bg = colors.HexColor('#FFEB9C')
-            fg = colors.HexColor('#9C5700')
-        else:
-            bg = colors.HexColor('#FFC7CE')
-            fg = colors.HexColor('#9C0006')
-        estilo_tabla.add('BACKGROUND', (2, i), (2, i), bg)
-        estilo_tabla.add('TEXTCOLOR', (2, i), (2, i), fg)
-        estilo_tabla.add('FONTNAME', (2, i), (2, i), 'Helvetica-Bold')
-        # Alternar fondo de filas
-        if i % 2 == 0:
-            estilo_tabla.add('BACKGROUND', (0, i), (1, i), colors.HexColor('#EBF3FB'))
-            estilo_tabla.add('BACKGROUND', (3, i), (-1, i), colors.HexColor('#EBF3FB'))
- 
-    tabla.setStyle(estilo_tabla)
-    elementos.append(tabla)
-    elementos.append(Spacer(1, 0.5*cm))
- 
-    # Resumen
-    reprobados = total - aprobados
-    resumen_data = [
-        ['Total estudiantes', 'Aprobados', 'Reprobados', 'Promedio'],
-        [str(total), f"{aprobados} ({aprobados/total*100:.0f}%)" if total else "0",
-         f"{reprobados} ({reprobados/total*100:.0f}%)" if total else "0",
-         f"{promedio:.2f} / 5.0"]
-    ]
-    tabla_resumen = Table(resumen_data, colWidths=[4*cm, 4*cm, 4*cm, 4.3*cm])
-    tabla_resumen.setStyle(TableStyle([
-        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#2E74B5')),
-        ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
-        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-        ('FONTSIZE', (0, 0), (-1, 0), 9),
-        ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
-        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
-        ('FONTNAME', (0, 1), (-1, 1), 'Helvetica-Bold'),
-        ('FONTSIZE', (0, 1), (-1, 1), 10),
-        ('TOPPADDING', (0, 0), (-1, -1), 6),
-        ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
-        ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#BDD7EE')),
-    ]))
-    elementos.append(tabla_resumen)
-    elementos.append(Spacer(1, 0.3*cm))
-    elementos.append(Paragraph("Sistema ZipGrade — Reporte generado automáticamente", estilo_footer))
- 
-    doc.build(elementos)
-    buffer.seek(0)
-    return buffer.getvalue()
- 
 # ── FUNCIONES DE ENVÍO (retornan message_id) ─────────────────────────────────
  
 async def send_message(token, chat_id, text, reply_markup=None) -> int:
@@ -422,12 +274,6 @@ async def send_excel(token, chat_id, excel_bytes, filename, caption=""):
             data={"chat_id": chat_id, "caption": caption},
             files={"document": (filename, excel_bytes,
                 "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")})
- 
-async def send_pdf_bytes(token, chat_id, pdf_bytes, filename, caption=""):
-    async with httpx.AsyncClient(timeout=60) as client:
-        await client.post(f"https://api.telegram.org/bot{token}/sendDocument",
-            data={"chat_id": chat_id, "caption": caption},
-            files={"document": (filename, pdf_bytes, "application/pdf")})
  
 async def send_voice(token, chat_id, file_id, source_token, caption=""):
     try:
@@ -1151,39 +997,6 @@ async def webhook_profe(request: Request, db: Session = Depends(get_db)):
                 filename = f"notas_{curso_buscar}_todos.xlsx".replace(" ", "_")
                 await send_excel(BOT_PROFE_TOKEN, chat_id, excel_bytes, filename, f"📊 {titulo} — {len(resultados)} registros")
  
-        elif cb_data.startswith("pdf_quiz_"):
-            partes = cb_data.replace("pdf_quiz_", "").split("|", 1)
-            curso_buscar = partes[0]
-            quiz_buscar = partes[1] if len(partes) > 1 else ""
-            resultados = db.query(Resultado).filter(
-                Resultado.curso_nombre.ilike(f"%{curso_buscar}%"),
-                Resultado.quiz_nombre.ilike(f"%{quiz_buscar}%"),
-                Resultado.confirmado == True
-            ).all()
-            if not resultados:
-                await send_message(BOT_PROFE_TOKEN, chat_id, f"❌ No hay resultados para {quiz_buscar}.")
-            else:
-                titulo = f"Notas - {curso_buscar} - {quiz_buscar}"
-                await send_message(BOT_PROFE_TOKEN, chat_id, "⏳ Generando PDF...")
-                pdf_bytes = generar_pdf_notas(resultados, titulo)
-                filename = f"notas_{curso_buscar}_{quiz_buscar}.pdf".replace(" ", "_")
-                await send_pdf_bytes(BOT_PROFE_TOKEN, chat_id, pdf_bytes, filename, f"📄 {titulo} — {len(resultados)} estudiantes")
- 
-        elif cb_data.startswith("pdf_todos_"):
-            curso_buscar = cb_data.replace("pdf_todos_", "")
-            resultados = db.query(Resultado).filter(
-                Resultado.curso_nombre.ilike(f"%{curso_buscar}%"),
-                Resultado.confirmado == True
-            ).all()
-            if not resultados:
-                await send_message(BOT_PROFE_TOKEN, chat_id, f"❌ No hay resultados para {curso_buscar}.")
-            else:
-                titulo = f"Todas las notas - {curso_buscar}"
-                await send_message(BOT_PROFE_TOKEN, chat_id, "⏳ Generando PDF...")
-                pdf_bytes = generar_pdf_notas(resultados, titulo)
-                filename = f"notas_{curso_buscar}_todos.pdf".replace(" ", "_")
-                await send_pdf_bytes(BOT_PROFE_TOKEN, chat_id, pdf_bytes, filename, f"📄 {titulo} — {len(resultados)} registros")
- 
         return {"ok": True}
  
     chat_id = message.get("chat", {}).get("id")
@@ -1458,7 +1271,7 @@ async def webhook_profe(request: Request, db: Session = Depends(get_db)):
                 await send_message(BOT_PROFE_TOKEN, chat_id,
                     f"✅ Hola <b>{profe.nombre}</b>!\n\n📋 Comandos:\n"
                     f"/micursos - Ver tus cursos\n/nuevocurso - Crear un curso\n/subirquiz - Subir quiz\n"
-                    f"/excel - Generar Excel de notas\n/pdf - Generar PDF de notas\n/estadisticas - Ver grafico del grupo\n"
+                    f"/excel - Generar Excel de notas\n/estadisticas - Ver grafico del grupo\n"
                     f"/enviar - Enviar archivo a un curso\n/grupos - Entrar a un grupo virtual\n/miembros - Ver y chatear en privado con un estudiante del grupo\n/estado - Ver suscripcion\n\n"
                     f"💬 Para responder individualmente:\n"
                     f"• Texto: <code>/responder ID mensaje</code>\n"
@@ -1607,22 +1420,6 @@ async def webhook_profe(request: Request, db: Session = Depends(get_db)):
             await send_message(BOT_PROFE_TOKEN, chat_id,
                 f"📊 ¿De qué materia quieres el Excel?\n\nMaterias disponibles:\n{lista}\n\nEscribe el nombre de la materia:")
  
-    elif text == "/pdf":
-        if not profe or not profe.activo:
-            await send_message(BOT_PROFE_TOKEN, chat_id, "❌ Necesitas suscripcion activa.")
-            return {"ok": True}
-        cursos_con_datos = db.query(Resultado.curso_nombre).filter(
-            Resultado.confirmado == True, Resultado.curso_nombre != None,
-            Resultado.profe_telegram_id == telegram_id
-        ).distinct().all()
-        if not cursos_con_datos:
-            await send_message(BOT_PROFE_TOKEN, chat_id, "❌ No hay resultados guardados aun.")
-        else:
-            set_estado(db, telegram_id, "paso", "esperando_materia_pdf")
-            lista = "\n".join([f"• <b>{c[0]}</b>" for c in cursos_con_datos])
-            await send_message(BOT_PROFE_TOKEN, chat_id,
-                f"📄 ¿De qué materia quieres el PDF de notas?\n\nMaterias disponibles:\n{lista}\n\nEscribe el nombre de la materia:")
- 
     elif text and text.startswith("/responder_voz"):
         partes = text.split(" ", 1)
         if len(partes) >= 2:
@@ -1679,21 +1476,6 @@ async def webhook_profe(request: Request, db: Session = Depends(get_db)):
                 botones_lista = [[{"text": f"📝 {q[0]}", "callback_data": f"excel_quiz_{materia}|{q[0]}"}] for q in quizzes]
                 botones_lista.append([{"text": "📊 Todos los quizzes", "callback_data": f"excel_todos_{materia}"}])
                 await send_message(BOT_PROFE_TOKEN, chat_id, f"📚 <b>{materia}</b> — ¿De qué quiz quieres el Excel?",
-                    reply_markup={"inline_keyboard": botones_lista})
- 
-        elif paso == "esperando_materia_pdf":
-            materia = text.strip()
-            del_estado(db, telegram_id, "paso")
-            quizzes = db.query(Resultado.quiz_nombre).filter(
-                Resultado.curso_nombre.ilike(f"%{materia}%"), Resultado.confirmado == True,
-                Resultado.quiz_nombre != None, Resultado.profe_telegram_id == telegram_id
-            ).distinct().all()
-            if not quizzes:
-                await send_message(BOT_PROFE_TOKEN, chat_id, f"❌ No encontré resultados para <b>{materia}</b>.")
-            else:
-                botones_lista = [[{"text": f"📝 {q[0]}", "callback_data": f"pdf_quiz_{materia}|{q[0]}"}] for q in quizzes]
-                botones_lista.append([{"text": "📄 Todos los quizzes", "callback_data": f"pdf_todos_{materia}"}])
-                await send_message(BOT_PROFE_TOKEN, chat_id, f"📚 <b>{materia}</b> — ¿De qué quiz quieres el PDF?",
                     reply_markup={"inline_keyboard": botones_lista})
  
         elif "PAG" in text[:5]:
@@ -2216,4 +1998,3 @@ def admin_activar_estudiante(telegram_id: int, db: Session = Depends(get_db)):
 def admin_desactivar_estudiante(telegram_id: int, db: Session = Depends(get_db)):
     desactivar_estudiante(telegram_id, db)
     return {"ok": True}
- 
