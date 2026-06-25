@@ -1136,6 +1136,9 @@ async def webhook_profe(request: Request, db: Session = Depends(get_db)):
         archivo_recibido = document.get("file_id")
         archivo_tipo = "document"
         archivo_nombre = document.get("file_name", "archivo")
+        # Si no tiene nombre con extensión, intentar detectar por mime_type
+        if not archivo_nombre.endswith(".pdf") and document.get("mime_type", "") == "application/pdf":
+            archivo_nombre = archivo_nombre + ".pdf" if archivo_nombre != "archivo" else "documento.pdf"
  
     if archivo_recibido:
         paso = get_estado(db, telegram_id, "paso")
@@ -1177,7 +1180,10 @@ async def webhook_profe(request: Request, db: Session = Depends(get_db)):
                 await send_message(BOT_PROFE_TOKEN, chat_id, f"❌ Error enviando archivo: {str(e)}")
             return {"ok": True}
  
-        elif archivo_tipo == "document" and archivo_nombre.endswith(".pdf"):
+        elif (archivo_tipo == "document" and
+              (archivo_nombre.endswith(".pdf") or
+               document.get("mime_type", "") == "application/pdf" or
+               get_estado(db, telegram_id, "paso") in ["esperando_pdf_zipgrade", "esperando_pdf_quiz"])):
             paso_actual = get_estado(db, telegram_id, "paso")
             curso_info = get_estado(db, telegram_id, "curso_seleccionado")
             quiz_nombre_estado = get_estado(db, telegram_id, "quiz_nombre")
