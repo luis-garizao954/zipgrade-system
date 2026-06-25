@@ -1088,9 +1088,18 @@ async def webhook_profe(request: Request, db: Session = Depends(get_db)):
                 file_id=fid, file_name=fname, remitente_msg_id=incoming_msg_id)
             return {"ok": True}
         if text and not text.startswith("/"):
-            await transmitir_grupo(db, grupo_activo, telegram_id, nombre, True, "text",
-                text=text, remitente_msg_id=incoming_msg_id)
-            return {"ok": True}
+            paso_actual = get_estado(db, telegram_id, "paso")
+            pasos_flujo = ["esperando_nombre_curso", "esperando_nombre_quiz", "esperando_pdf_zipgrade",
+                           "esperando_pdf_quiz", "esperando_nombres", "esperando_materia_excel"]
+            if paso_actual and (paso_actual in pasos_flujo or paso_actual.startswith("responder_") or
+                                paso_actual.startswith("enviar_archivo_")):
+                pass  # dejar caer al bloque de texto normal abajo
+            elif text[:3] == "PAG":
+                pass  # lista de nombres PAG, dejar caer al handler normal
+            else:
+                await transmitir_grupo(db, grupo_activo, telegram_id, nombre, True, "text",
+                    text=text, remitente_msg_id=incoming_msg_id)
+                return {"ok": True}
  
     if voice:
         voice_file_id = voice.get("file_id")
