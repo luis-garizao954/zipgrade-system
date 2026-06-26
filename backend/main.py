@@ -1473,6 +1473,66 @@ async def webhook_estudiante(request: Request, db: Session = Depends(get_db)):
                 f"📚 Materia: <b>{materia}</b>\n\n"
                 f"✏️ Puedes enviar mensajes, notas de voz 🎙️, archivos 📎 e imágenes 🖼️ durante 15 minutos.\n\n"
                 f"La sesion se cerrara automaticamente.")
+ 
+        elif cb_data.startswith("mis_materia_"):
+            # Estudiante seleccionó una materia → mostrar quizzes disponibles de esa materia
+            materia_sel = cb_data.replace("mis_materia_", "")
+            est = db.query(Estudiante).filter(Estudiante.telegram_id == telegram_id).first()
+            if not est:
+                await send_message(BOT_ESTUDIANTE_TOKEN, chat_id, "❌ No estás registrado.")
+                return {"ok": True}
+            quizzes = db.query(Resultado.quiz_nombre).filter(
+                Resultado.nombre_temp.ilike(f"%{est.nombre}%"),
+                Resultado.curso_nombre.ilike(f"%{materia_sel}%"),
+                Resultado.confirmado == True
+            ).distinct().all()
+            if not quizzes:
+                await send_message(BOT_ESTUDIANTE_TOKEN, chat_id,
+                    f"❌ No encontré evaluaciones registradas para <b>{materia_sel}</b>.")
+                return {"ok": True}
+            botones = {"inline_keyboard": [
+                [{"text": f"📝 {q[0]}", "callback_data": f"mis_quiz_{materia_sel}||{q[0]}"}]
+                for q in quizzes
+            ]}
+            await send_message(BOT_ESTUDIANTE_TOKEN, chat_id,
+                f"📚 <b>{materia_sel}</b>\n\nSelecciona el quiz o evaluación que quieres consultar:",
+                reply_markup=botones)
+ 
+        elif cb_data.startswith("mis_quiz_"):
+            # Estudiante seleccionó un quiz → mostrar resultado
+            resto = cb_data.replace("mis_quiz_", "")
+            partes = resto.split("||", 1)
+            materia_sel = partes[0]
+            quiz_sel = partes[1] if len(partes) > 1 else ""
+            est = db.query(Estudiante).filter(Estudiante.telegram_id == telegram_id).first()
+            if not est:
+                await send_message(BOT_ESTUDIANTE_TOKEN, chat_id, "❌ No estás registrado.")
+                return {"ok": True}
+            resultados = db.query(Resultado).filter(
+                Resultado.nombre_temp.ilike(f"%{est.nombre}%"),
+                Resultado.curso_nombre.ilike(f"%{materia_sel}%"),
+                Resultado.quiz_nombre.ilike(f"%{quiz_sel}%"),
+                Resultado.confirmado == True
+            ).all()
+            if not resultados:
+                await send_message(BOT_ESTUDIANTE_TOKEN, chat_id,
+                    f"❌ No encontré resultados para <b>{quiz_sel}</b> en <b>{materia_sel}</b>.")
+                return {"ok": True}
+            for r in resultados:
+                nota = float(r.nota) if r.nota else 0
+                porcentaje = float(r.porcentaje) if r.porcentaje else 0
+                estado = "✅ Aprobado" if nota >= 3.0 else "❌ Reprobado"
+                await send_message(BOT_ESTUDIANTE_TOKEN, chat_id,
+                    f"📚 <b>{r.curso_nombre}</b>\n"
+                    f"📝 <b>{r.quiz_nombre}</b>\n"
+                    f"🎯 Nota: <b>{nota:.2f} / 5.0</b> ({porcentaje:.0f}%)\n"
+                    f"{estado}")
+                if r.imagen_url:
+                    await send_photo(BOT_ESTUDIANTE_TOKEN, chat_id, r.imagen_url,
+                        f"📋 Tu hoja de respuestas — {r.quiz_nombre}")
+                if r.quiz_pdf_url:
+                    await send_document_url(BOT_ESTUDIANTE_TOKEN, chat_id, r.quiz_pdf_url,
+                        f"📄 PDF del quiz — {r.quiz_nombre}")
         return {"ok": True}
  
     chat_id = message.get("chat", {}).get("id")
