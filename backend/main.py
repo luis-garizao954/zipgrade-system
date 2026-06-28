@@ -528,7 +528,62 @@ def guardar_mensaje_grupo(db, curso_id, curso_nombre, remitente_nombre, es_profe
     ))
     db.commit()
  
+# ── MEMBRESÍA DE GRUPO ───────────────────────────────────────────────────────
+# Registra qué estudiantes son miembros de cada curso/grupo.
+# Se guarda en Resultado con nombre_temp = __miembro__{curso_id}__{telegram_id}
+ 
+def registrar_miembro_grupo(db, curso_id, telegram_id):
+    """Registra al estudiante como miembro del grupo si no lo está ya."""
+    clave = f"__miembro__{curso_id}__{telegram_id}"
+    r = db.query(Resultado).filter(Resultado.nombre_temp == clave).first()
+    if not r:
+        db.add(Resultado(
+            id=uuid.uuid4(),
+            nombre_temp=clave,
+            quiz_nombre=str(telegram_id),
+            confirmado=False
+        ))
+        db.commit()
+ 
+def obtener_miembros_grupo(db, curso_id):
+    """Retorna lista de telegram_ids de todos los estudiantes miembros del grupo."""
+    clave_prefix = f"__miembro__{curso_id}__"
+    registros = db.query(Resultado).filter(
+        Resultado.nombre_temp.like(f"{clave_prefix}%")
+    ).all()
+    ids = []
+    for r in registros:
+        try:
+            tid = int(r.nombre_temp.replace(clave_prefix, ""))
+            ids.append(tid)
+        except:
+            pass
+    return ids
+ 
 def get_estudiantes_telegram_ids(db, curso_nombre, profe_telegram_id):
+    """
+    Retorna todos los telegram_ids de estudiantes del curso.
+    Combina:
+    1. Estudiantes registrados como miembros del grupo (nuevos, sin resultados aún)
+    2. Estudiantes que tienen resultados en ese curso (flujo anterior)
+    """
+    telegram_ids = []
+ 
+    # Buscar el curso para obtener su ID
+    profe_obj = db.query(Profe).filter(Profe.telegram_id == profe_telegram_id).first()
+    if profe_obj:
+        curso_obj = db.query(Curso).filter(
+            Curso.profe_id == profe_obj.id,
+            Curso.nombre == curso_nombre
+        ).first()
+        if curso_obj:
+            # 1. Miembros registrados al entrar al grupo
+            miembros = obtener_miembros_grupo(db, str(curso_obj.id))
+            for tid in miembros:
+                if tid not in telegram_ids:
+                    telegram_ids.append(tid)
+ 
+    # 2. Estudiantes con resultados en ese curso (flujo original)
     nombres = db.query(Resultado.nombre_temp).filter(
         Resultado.curso_nombre == curso_nombre,
         Resultado.profe_telegram_id == profe_telegram_id,
@@ -536,9 +591,9 @@ def get_estudiantes_telegram_ids(db, curso_nombre, profe_telegram_id):
         Resultado.nombre_temp != None,
         ~Resultado.nombre_temp.like("__grupo__%"),
         ~Resultado.nombre_temp.like("__estado__%"),
+        ~Resultado.nombre_temp.like("__miembro__%"),
         ~Resultado.nombre_temp.like("PAG%"),
     ).distinct().all()
-    telegram_ids = []
     for (nombre_r,) in nombres:
         if not nombre_r:
             continue
@@ -551,7 +606,8 @@ def get_estudiantes_telegram_ids(db, curso_nombre, profe_telegram_id):
                         break
         if est and est.telegram_id and est.telegram_id not in telegram_ids:
             telegram_ids.append(est.telegram_id)
-    print(f"[GRUPO] curso='{curso_nombre}' profe_tid={profe_telegram_id} | estudiantes encontrados: {len(telegram_ids)} | ids: {telegram_ids}")
+ 
+    print(f"[GRUPO] curso='{curso_nombre}' profe_tid={profe_telegram_id} | miembros totales: {len(telegram_ids)} | ids: {telegram_ids}")
     return telegram_ids
  
 async def enviar_media_grupo_con_registro(client, token, chat_id, origen_token, tipo, file_id, file_name, prefijo, db, curso_id):
@@ -637,7 +693,16 @@ async def transmitir_grupo(db, curso_id, remitente_id, remitente_nombre, es_prof
         return
     profe_curso = db.query(Profe).filter(Profe.id == curso.profe_id).first()
     profe_telegram_id = profe_curso.telegram_id if profe_curso else None
+ 
+    # Combinar miembros registrados + miembros con resultados
     est_ids = get_estudiantes_telegram_ids(db, curso.nombre, profe_telegram_id)
+ 
+    # También incluir miembros directos por membresía (por si acaso el nombre no coincide)
+    miembros_directos = obtener_miembros_grupo(db, str(curso_id))
+    for tid in miembros_directos:
+        if tid not in est_ids:
+            est_ids.append(tid)
+ 
     guardar_mensaje_grupo(db, curso_id, curso.nombre, remitente_nombre, es_profe,
         tipo, contenido=text, file_id=file_id, file_name=file_name)
     if remitente_msg_id:
@@ -648,6 +713,7 @@ async def transmitir_grupo(db, curso_id, remitente_id, remitente_nombre, es_prof
             destinatarios.append((BOT_ESTUDIANTE_TOKEN, tid))
     if profe_telegram_id and profe_telegram_id != remitente_id:
         destinatarios.append((BOT_PROFE_TOKEN, profe_telegram_id))
+    print(f"[transmitir_grupo] curso='{curso.nombre}' remitente={remitente_id} tipo={tipo} | destinatarios={len(destinatarios)} -> {destinatarios}")
     if not destinatarios:
         return
     origen_token = BOT_PROFE_TOKEN if es_profe else BOT_ESTUDIANTE_TOKEN
@@ -1464,6 +1530,9 @@ async def webhook_estudiante(request: Request, db: Session = Depends(get_db)):
                 est_obj = db.query(Estudiante).filter(Estudiante.telegram_id == telegram_id).first()
                 if est_obj and est_obj.nombre:
                     est_nombre = est_obj.nombre
+                # ── REGISTRAR MEMBRESÍA ──────────────────────────────────────
+                registrar_miembro_grupo(db, str(curso_id), telegram_id)
+                # ─────────────────────────────────────────────────────────────
                 entrar_grupo(db, telegram_id, curso_id, f"{curso.nombre} {curso.grado}")
                 mid = await send_message(BOT_ESTUDIANTE_TOKEN, chat_id,
                     f"🏫 <b>Entraste al grupo: {curso.nombre} {curso.grado}</b>\n\n"
@@ -2078,3 +2147,4 @@ def admin_activar_estudiante(telegram_id: int, db: Session = Depends(get_db)):
 def admin_desactivar_estudiante(telegram_id: int, db: Session = Depends(get_db)):
     desactivar_estudiante(telegram_id, db)
     return {"ok": True}
+ 
