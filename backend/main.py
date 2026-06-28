@@ -1460,6 +1460,10 @@ async def webhook_estudiante(request: Request, db: Session = Depends(get_db)):
             curso = db.query(Curso).filter(Curso.id == curso_id).first()
             if curso:
                 est_nombre = callback.get("from", {}).get("first_name", "Un estudiante")
+                # Usar el nombre registrado del estudiante si existe
+                est_obj = db.query(Estudiante).filter(Estudiante.telegram_id == telegram_id).first()
+                if est_obj and est_obj.nombre:
+                    est_nombre = est_obj.nombre
                 entrar_grupo(db, telegram_id, curso_id, f"{curso.nombre} {curso.grado}")
                 mid = await send_message(BOT_ESTUDIANTE_TOKEN, chat_id,
                     f"🏫 <b>Entraste al grupo: {curso.nombre} {curso.grado}</b>\n\n"
@@ -1784,37 +1788,56 @@ async def webhook_estudiante(request: Request, db: Session = Depends(get_db)):
     elif text == "/grupos":
         est = db.query(Estudiante).filter(Estudiante.telegram_id == telegram_id).first()
         if not est or not est.nombre:
-            await send_message(BOT_ESTUDIANTE_TOKEN, chat_id, "❌ Primero escribe tu nombre completo para registrarte.")
+            await send_message(BOT_ESTUDIANTE_TOKEN, chat_id,
+                "❌ Primero escribe tu <b>nombre completo</b> tal como aparece en tu lista de clase.")
             return {"ok": True}
-        cursos_data = db.query(Resultado.curso_nombre, Resultado.profe_telegram_id).filter(
+ 
+        # Obtener TODOS los cursos existentes en el sistema (de todos los profes activos)
+        todos_los_cursos = db.query(Curso).join(Profe, Curso.profe_id == Profe.id).filter(
+            Profe.activo == True
+        ).all()
+ 
+        if not todos_los_cursos:
+            await send_message(BOT_ESTUDIANTE_TOKEN, chat_id,
+                "❌ No hay grupos disponibles en este momento.")
+            return {"ok": True}
+ 
+        # Marcar cuáles ya tiene el estudiante (para mostrar indicador visual)
+        cursos_con_resultados = set()
+        resultados_est = db.query(Resultado.curso_nombre).filter(
             Resultado.nombre_temp.ilike(f"%{est.nombre}%"),
             Resultado.confirmado == True,
             Resultado.curso_nombre != None
         ).distinct().all()
-        if not cursos_data:
-            await send_message(BOT_ESTUDIANTE_TOKEN, chat_id, "❌ No tienes materias registradas aun. Escribe tu nombre primero.")
-            return {"ok": True}
+        for (cn,) in resultados_est:
+            if cn:
+                cursos_con_resultados.add(cn.lower())
+ 
         botones_grupos = []
-        for cd in cursos_data:
-            curso_nombre_cd = cd[0]
-            profe_tid_cd = cd[1]
-            if not profe_tid_cd:
-                continue
-            profe_obj = db.query(Profe).filter(Profe.telegram_id == profe_tid_cd).first()
-            if not profe_obj:
-                continue
-            curso_obj = db.query(Curso).filter(Curso.profe_id == profe_obj.id, Curso.nombre == curso_nombre_cd).first()
-            if curso_obj:
-                botones_grupos.append([{"text": f"🏫 {curso_nombre_cd} - {curso_obj.grado}", "callback_data": f"grupo_est_{curso_obj.id}"}])
-        if not botones_grupos:
-            await send_message(BOT_ESTUDIANTE_TOKEN, chat_id, "❌ No encontré grupos disponibles.")
-            return {"ok": True}
+        for curso_obj in todos_los_cursos:
+            tiene_resultados = curso_obj.nombre.lower() in cursos_con_resultados
+            icono = "📊" if tiene_resultados else "🏫"
+            botones_grupos.append([{
+                "text": f"{icono} {curso_obj.nombre} - {curso_obj.grado}",
+                "callback_data": f"grupo_est_{curso_obj.id}"
+            }])
+ 
         grupo_actual = get_grupo_activo(db, telegram_id)
         grupo_nombre_actual = get_grupo_nombre(db, telegram_id)
-        msg = "🏫 <b>Grupos virtuales</b>\n\nSelecciona el grupo al que quieres entrar:"
+        msg = (
+            "🏫 <b>Grupos disponibles</b>\n\n"
+            "📊 = ya tienes notas registradas\n"
+            "🏫 = grupo nuevo\n\n"
+            "Selecciona el grupo al que quieres entrar:"
+        )
         if grupo_actual:
-            msg = f"🏫 Actualmente estás en: <b>{grupo_nombre_actual}</b>\n\nUsa /salir_grupo para salir o cambia de grupo:"
-        await send_message(BOT_ESTUDIANTE_TOKEN, chat_id, msg, reply_markup={"inline_keyboard": botones_grupos})
+            msg = (
+                f"🏫 Actualmente estás en: <b>{grupo_nombre_actual}</b>\n\n"
+                f"Usa /salir_grupo para salir o cambia de grupo:\n\n"
+                f"📊 = ya tienes notas  |  🏫 = grupo nuevo"
+            )
+        await send_message(BOT_ESTUDIANTE_TOKEN, chat_id, msg,
+            reply_markup={"inline_keyboard": botones_grupos})
  
     elif text == "/salir_grupo":
         grupo_nombre_actual = get_grupo_nombre(db, telegram_id)
