@@ -634,7 +634,6 @@ async def transmitir_grupo(db, curso_id, remitente_id, remitente_nombre, es_prof
     prefijo = f"👨‍🏫 <b>[PROFE] {remitente_nombre}:</b>" if es_profe else f"👥 <b>[GRUPO] {remitente_nombre}:</b>"
     curso = db.query(Curso).filter(Curso.id == curso_id).first()
     if not curso:
-        print(f"[transmitir_grupo] ERROR: curso {curso_id} no existe")
         return
     profe_curso = db.query(Profe).filter(Profe.id == curso.profe_id).first()
     profe_telegram_id = profe_curso.telegram_id if profe_curso else None
@@ -649,7 +648,6 @@ async def transmitir_grupo(db, curso_id, remitente_id, remitente_nombre, es_prof
             destinatarios.append((BOT_ESTUDIANTE_TOKEN, tid))
     if profe_telegram_id and profe_telegram_id != remitente_id:
         destinatarios.append((BOT_PROFE_TOKEN, profe_telegram_id))
-    print(f"[transmitir_grupo] curso='{curso.nombre}' remitente_id={remitente_id} es_profe={es_profe} tipo={tipo} | destinatarios={len(destinatarios)}")
     if not destinatarios:
         return
     origen_token = BOT_PROFE_TOKEN if es_profe else BOT_ESTUDIANTE_TOKEN
@@ -663,8 +661,6 @@ async def transmitir_grupo(db, curso_id, remitente_id, remitente_nombre, es_prof
                     if data.get("ok"):
                         mid = data["result"]["message_id"]
                         registrar_msg_grupo(db, chat_id, str(curso_id), mid)
-                    else:
-                        print(f"[transmitir_grupo] FALLO texto -> {chat_id}: {data}")
                 else:
                     await enviar_media_grupo_con_registro(client, token, chat_id, origen_token, tipo, file_id, file_name, prefijo, db, curso_id)
             except Exception as e:
@@ -791,6 +787,27 @@ def set_estado(db, telegram_id, clave, valor):
 def del_estado(db, telegram_id, clave):
     db.query(Resultado).filter(Resultado.nombre_temp == f"__estado__{telegram_id}__{clave}").delete(synchronize_session=False)
     db.commit()
+ 
+# ── HELPER: buscar resultados de un estudiante por nombre ─────────────────────
+ 
+def buscar_resultados_estudiante(db, nombre_estudiante):
+    """Busca resultados por nombre completo; si no encuentra, prueba con partes del nombre."""
+    resultados = db.query(Resultado).filter(
+        Resultado.nombre_temp.ilike(f"%{nombre_estudiante}%"),
+        Resultado.confirmado == True,
+        Resultado.curso_nombre != None
+    ).all()
+    if not resultados:
+        for parte in nombre_estudiante.strip().split():
+            if len(parte) > 3:
+                resultados = db.query(Resultado).filter(
+                    Resultado.nombre_temp.ilike(f"%{parte}%"),
+                    Resultado.confirmado == True,
+                    Resultado.curso_nombre != None
+                ).all()
+                if resultados:
+                    break
+    return resultados
  
 @app.on_event("startup")
 async def set_webhooks():
@@ -926,7 +943,6 @@ async def webhook_profe(request: Request, db: Session = Depends(get_db)):
  
     profe = db.query(Profe).filter(Profe.telegram_id == telegram_id).first()
  
-    # ── CHAT INDIVIDUAL ACTIVO (prioridad sobre el grupo) ────────────────────
     chat_ind = get_chat_individual(db, telegram_id)
     if chat_ind and text != "/volver_grupo":
         estudiante_tid, curso_id_ind, _desde = chat_ind
@@ -998,7 +1014,7 @@ async def webhook_profe(request: Request, db: Session = Depends(get_db)):
             paso_actual = get_estado(db, telegram_id, "paso")
             pasos_flujo = ["esperando_pdf_zipgrade", "esperando_pdf_quiz", "esperando_archivo_para_curso"]
             if paso_actual and paso_actual in pasos_flujo:
-                pass  # dejar caer al handler normal
+                pass
             else:
                 await transmitir_grupo(db, grupo_activo, telegram_id, nombre, True, "document",
                     file_id=fid, file_name=fname, remitente_msg_id=incoming_msg_id)
@@ -1009,9 +1025,9 @@ async def webhook_profe(request: Request, db: Session = Depends(get_db)):
                            "esperando_pdf_quiz", "esperando_nombres", "esperando_materia_excel"]
             if paso_actual and (paso_actual in pasos_flujo or paso_actual.startswith("responder_") or
                                 paso_actual.startswith("enviar_archivo_")):
-                pass  # dejar caer al bloque de texto normal
+                pass
             elif text[:3] == "PAG":
-                pass  # lista PAG, dejar caer al handler normal
+                pass
             else:
                 await transmitir_grupo(db, grupo_activo, telegram_id, nombre, True, "text",
                     text=text, remitente_msg_id=incoming_msg_id)
@@ -1474,65 +1490,95 @@ async def webhook_estudiante(request: Request, db: Session = Depends(get_db)):
                 f"✏️ Puedes enviar mensajes, notas de voz 🎙️, archivos 📎 e imágenes 🖼️ durante 15 minutos.\n\n"
                 f"La sesion se cerrara automaticamente.")
  
-        elif cb_data.startswith("mis_materia_"):
-            # Estudiante seleccionó una materia → mostrar quizzes disponibles de esa materia
-            materia_sel = cb_data.replace("mis_materia_", "")
+        # ── NUEVO: Estudiante seleccionó una asignatura en /misnotas ─────────
+        elif cb_data.startswith("mn_mat_"):
+            # Formato: mn_mat_<nombre_materia>
+            materia_sel = cb_data[len("mn_mat_"):]
             est = db.query(Estudiante).filter(Estudiante.telegram_id == telegram_id).first()
-            if not est:
+            if not est or not est.nombre:
                 await send_message(BOT_ESTUDIANTE_TOKEN, chat_id, "❌ No estás registrado.")
                 return {"ok": True}
+            # Buscar todos los quizzes de esa materia para este estudiante
             quizzes = db.query(Resultado.quiz_nombre).filter(
                 Resultado.nombre_temp.ilike(f"%{est.nombre}%"),
                 Resultado.curso_nombre.ilike(f"%{materia_sel}%"),
                 Resultado.confirmado == True
             ).distinct().all()
             if not quizzes:
+                # intentar búsqueda por parte del nombre
+                for parte in est.nombre.strip().split():
+                    if len(parte) > 3:
+                        quizzes = db.query(Resultado.quiz_nombre).filter(
+                            Resultado.nombre_temp.ilike(f"%{parte}%"),
+                            Resultado.curso_nombre.ilike(f"%{materia_sel}%"),
+                            Resultado.confirmado == True
+                        ).distinct().all()
+                        if quizzes:
+                            break
+            if not quizzes:
                 await send_message(BOT_ESTUDIANTE_TOKEN, chat_id,
                     f"❌ No encontré evaluaciones registradas para <b>{materia_sel}</b>.")
                 return {"ok": True}
+            # Mostrar botones con los quizzes disponibles
+            # Truncar nombre del quiz a 40 chars para que el callback_data no supere 64 bytes
             botones = {"inline_keyboard": [
-                [{"text": f"📝 {q[0]}", "callback_data": f"mis_quiz_{materia_sel}||{q[0]}"}]
+                [{"text": f"📝 {q[0]}", "callback_data": f"mn_qz_{materia_sel[:20]}|{q[0][:35]}"}]
                 for q in quizzes
             ]}
             await send_message(BOT_ESTUDIANTE_TOKEN, chat_id,
-                f"📚 <b>{materia_sel}</b>\n\nSelecciona el quiz o evaluación que quieres consultar:",
+                f"📚 <b>{materia_sel}</b>\n\nSelecciona el quiz o período que quieres consultar:",
                 reply_markup=botones)
  
-        elif cb_data.startswith("mis_quiz_"):
-            # Estudiante seleccionó un quiz → mostrar resultado
-            resto = cb_data.replace("mis_quiz_", "")
-            partes = resto.split("||", 1)
-            materia_sel = partes[0]
-            quiz_sel = partes[1] if len(partes) > 1 else ""
+        # ── NUEVO: Estudiante seleccionó un quiz específico en /misnotas ─────
+        elif cb_data.startswith("mn_qz_"):
+            # Formato: mn_qz_<materia_truncada>|<quiz_truncado>
+            resto = cb_data[len("mn_qz_"):]
+            partes = resto.split("|", 1)
+            materia_buscar = partes[0] if len(partes) > 0 else ""
+            quiz_buscar = partes[1] if len(partes) > 1 else ""
             est = db.query(Estudiante).filter(Estudiante.telegram_id == telegram_id).first()
-            if not est:
+            if not est or not est.nombre:
                 await send_message(BOT_ESTUDIANTE_TOKEN, chat_id, "❌ No estás registrado.")
                 return {"ok": True}
+            # Buscar el resultado exacto
             resultados = db.query(Resultado).filter(
                 Resultado.nombre_temp.ilike(f"%{est.nombre}%"),
-                Resultado.curso_nombre.ilike(f"%{materia_sel}%"),
-                Resultado.quiz_nombre.ilike(f"%{quiz_sel}%"),
+                Resultado.curso_nombre.ilike(f"%{materia_buscar}%"),
+                Resultado.quiz_nombre.ilike(f"%{quiz_buscar}%"),
                 Resultado.confirmado == True
             ).all()
+            # Si no encontró por nombre completo, buscar por partes
+            if not resultados:
+                for parte in est.nombre.strip().split():
+                    if len(parte) > 3:
+                        resultados = db.query(Resultado).filter(
+                            Resultado.nombre_temp.ilike(f"%{parte}%"),
+                            Resultado.curso_nombre.ilike(f"%{materia_buscar}%"),
+                            Resultado.quiz_nombre.ilike(f"%{quiz_buscar}%"),
+                            Resultado.confirmado == True
+                        ).all()
+                        if resultados:
+                            break
             if not resultados:
                 await send_message(BOT_ESTUDIANTE_TOKEN, chat_id,
-                    f"❌ No encontré resultados para <b>{quiz_sel}</b> en <b>{materia_sel}</b>.")
+                    f"❌ No encontré tu resultado para ese quiz en <b>{materia_buscar}</b>.")
                 return {"ok": True}
             for r in resultados:
                 nota = float(r.nota) if r.nota else 0
                 porcentaje = float(r.porcentaje) if r.porcentaje else 0
-                estado = "✅ Aprobado" if nota >= 3.0 else "❌ Reprobado"
+                estado_emoji = "✅ Aprobado" if nota >= 3.0 else "❌ Reprobado"
                 await send_message(BOT_ESTUDIANTE_TOKEN, chat_id,
                     f"📚 <b>{r.curso_nombre}</b>\n"
                     f"📝 <b>{r.quiz_nombre}</b>\n"
                     f"🎯 Nota: <b>{nota:.2f} / 5.0</b> ({porcentaje:.0f}%)\n"
-                    f"{estado}")
+                    f"{estado_emoji}")
                 if r.imagen_url:
                     await send_photo(BOT_ESTUDIANTE_TOKEN, chat_id, r.imagen_url,
                         f"📋 Tu hoja de respuestas — {r.quiz_nombre}")
                 if r.quiz_pdf_url:
                     await send_document_url(BOT_ESTUDIANTE_TOKEN, chat_id, r.quiz_pdf_url,
                         f"📄 PDF del quiz — {r.quiz_nombre}")
+ 
         return {"ok": True}
  
     chat_id = message.get("chat", {}).get("id")
@@ -1550,7 +1596,6 @@ async def webhook_estudiante(request: Request, db: Session = Depends(get_db)):
  
     estudiante = db.query(Estudiante).filter(Estudiante.telegram_id == telegram_id).first()
  
-    # ── CHAT INDIVIDUAL DEL ESTUDIANTE ───────────────────────────────────────
     chat_ind_est = get_chat_individual(db, telegram_id)
     if chat_ind_est and text != "/volver_grupo":
         profe_tid_ind, curso_id_ind_est, _desde_est = chat_ind_est
@@ -1720,9 +1765,9 @@ async def webhook_estudiante(request: Request, db: Session = Depends(get_db)):
                 f"👋 Hola <b>{nombre}</b>!\n\nBienvenido al sistema ZipGrade.\n\n"
                 f"Para ver tus notas:\n"
                 f"1️⃣ Escribe tu <b>nombre completo</b> tal como aparece en tu lista de clase\n"
-                f"2️⃣ Luego usa /misnotas\n\n"
+                f"2️⃣ Luego usa /misnotas para consultar por asignatura y período\n\n"
                 f"📋 Comandos:\n"
-                f"• /misnotas — Ver tus notas, hojas de respuesta y PDF del quiz\n"
+                f"• /misnotas — Consultar notas por asignatura y período\n"
                 f"• /grafico — Ver tu gráfico de rendimiento\n"
                 f"• /grupos — Entrar al chat grupal de una materia\n"
                 f"• /duda — Contactar a tu profe en privado")
@@ -1730,7 +1775,7 @@ async def webhook_estudiante(request: Request, db: Session = Depends(get_db)):
             await send_message(BOT_ESTUDIANTE_TOKEN, chat_id,
                 f"✅ Hola <b>{estudiante.nombre}</b>!\n\n"
                 f"📋 Comandos:\n"
-                f"• /misnotas — Ver tus notas, hojas de respuesta y PDF del quiz\n"
+                f"• /misnotas — Consultar notas por asignatura y período\n"
                 f"• /grafico — Ver tu gráfico de rendimiento\n"
                 f"• /grupos — Entrar al chat grupal\n"
                 f"• /enviar_profesor — (dentro de un grupo) escribirle en privado al profe\n"
@@ -1816,47 +1861,43 @@ async def webhook_estudiante(request: Request, db: Session = Depends(get_db)):
                 await send_message(BOT_ESTUDIANTE_TOKEN, chat_id, "❌ Error generando el grafico.")
  
     elif text == "/misnotas":
+        # ── PASO 1: mostrar botones de asignaturas disponibles ───────────────
         est = db.query(Estudiante).filter(Estudiante.telegram_id == telegram_id).first()
         if not est or not est.nombre:
             await send_message(BOT_ESTUDIANTE_TOKEN, chat_id,
-                "❌ No estás registrado aún.\n\nEscribe tu <b>nombre completo</b> tal como aparece en tu lista de clase para ver tus notas.")
+                "❌ No estás registrado aún.\n\nEscribe tu <b>nombre completo</b> tal como aparece en tu lista de clase.")
             return {"ok": True}
-        resultados = db.query(Resultado).filter(
+        # Buscar materias disponibles para este estudiante
+        materias = db.query(Resultado.curso_nombre).filter(
             Resultado.nombre_temp.ilike(f"%{est.nombre}%"),
             Resultado.confirmado == True,
             Resultado.curso_nombre != None
-        ).all()
-        if not resultados:
-            partes_nombre = est.nombre.strip().split()
-            for parte in partes_nombre:
+        ).distinct().all()
+        # Si no encuentra por nombre completo, probar con partes
+        if not materias:
+            for parte in est.nombre.strip().split():
                 if len(parte) > 3:
-                    resultados = db.query(Resultado).filter(
+                    materias = db.query(Resultado.curso_nombre).filter(
                         Resultado.nombre_temp.ilike(f"%{parte}%"),
                         Resultado.confirmado == True,
                         Resultado.curso_nombre != None
-                    ).all()
-                    if resultados:
+                    ).distinct().all()
+                    if materias:
                         break
-        if not resultados:
+        if not materias:
             await send_message(BOT_ESTUDIANTE_TOKEN, chat_id,
                 f"❌ No encontré resultados para <b>{est.nombre}</b>.\n\n"
                 f"Verifica que tu nombre coincida con el de tu lista de clase.")
             return {"ok": True}
+        # Mostrar botones — uno por asignatura
+        botones = {"inline_keyboard": [
+            [{"text": f"📚 {m[0]}", "callback_data": f"mn_mat_{m[0][:55]}"}]
+            for m in materias
+        ]}
         await send_message(BOT_ESTUDIANTE_TOKEN, chat_id,
-            f"📊 <b>Tus resultados, {est.nombre}:</b>\n\n"
-            f"A continuación te envío cada evaluación con tu nota, hoja de respuestas y PDF del quiz.")
-        for r in resultados:
-            curso = r.curso_nombre or "Sin curso"
-            quiz = r.quiz_nombre or "Sin quiz"
-            nota = float(r.nota) if r.nota else 0
-            porcentaje = float(r.porcentaje) if r.porcentaje else 0
-            estado = "✅ Aprobado" if nota >= 3.0 else "❌ Reprobado"
-            await send_message(BOT_ESTUDIANTE_TOKEN, chat_id,
-                f"📚 <b>{curso}</b>\n📝 <b>{quiz}</b>\n🎯 Nota: <b>{nota:.2f} / 5.0</b> ({porcentaje:.0f}%)\n{estado}")
-            if r.imagen_url:
-                await send_photo(BOT_ESTUDIANTE_TOKEN, chat_id, r.imagen_url, f"📋 Tu hoja de respuestas — {quiz}")
-            if r.quiz_pdf_url:
-                await send_document_url(BOT_ESTUDIANTE_TOKEN, chat_id, r.quiz_pdf_url, f"📄 PDF del quiz — {quiz}")
+            f"📋 <b>Consulta de notas — {est.nombre}</b>\n\n"
+            f"Selecciona la asignatura que deseas consultar:",
+            reply_markup=botones)
  
     elif text and not text.startswith("/"):
         esperando = get_estado(db, telegram_id, "esperando_duda")
@@ -1909,22 +1950,22 @@ async def webhook_estudiante(request: Request, db: Session = Depends(get_db)):
                 if est and est.nombre != busqueda:
                     est.nombre = busqueda
                     db.commit()
-                msg = f"📊 <b>Todas tus notas ({busqueda}):</b>\n\n"
-                for r in resultados_nombre:
-                    curso = r.curso_nombre or "Sin curso"
-                    quiz = r.quiz_nombre or "Sin quiz"
-                    msg += f"📚 <b>{curso}</b> - {quiz}: <b>{r.nota}/5.0</b> ({r.porcentaje}%)\n"
+                msg = f"📊 <b>Nombre registrado: {busqueda}</b>\n\nUsa /misnotas para consultar tus notas por asignatura."
                 await send_message(BOT_ESTUDIANTE_TOKEN, chat_id, msg)
-                for r in resultados_nombre:
-                    if r.imagen_url:
-                        await send_photo(BOT_ESTUDIANTE_TOKEN, chat_id, r.imagen_url, f"📋 {r.curso_nombre} - {r.quiz_nombre}")
-                    if r.quiz_pdf_url:
-                        await send_document_url(BOT_ESTUDIANTE_TOKEN, chat_id, r.quiz_pdf_url, f"📄 {r.curso_nombre} - {r.quiz_nombre}")
             else:
-                await send_message(BOT_ESTUDIANTE_TOKEN, chat_id,
-                    f"❌ No encontré resultados para <b>{busqueda}</b>.\n\n"
-                    f"Intenta con tu nombre completo o el nombre de la materia.\n"
-                    f"¿Tienes una duda? Usa /duda para contactar a tu profe.")
+                # Registrar el nombre del estudiante si no existe
+                est = db.query(Estudiante).filter(Estudiante.telegram_id == telegram_id).first()
+                if est:
+                    est.nombre = busqueda
+                    db.commit()
+                    await send_message(BOT_ESTUDIANTE_TOKEN, chat_id,
+                        f"✅ Nombre registrado: <b>{busqueda}</b>\n\n"
+                        f"Usa /misnotas para consultar tus notas por asignatura y período.")
+                else:
+                    await send_message(BOT_ESTUDIANTE_TOKEN, chat_id,
+                        f"❌ No encontré resultados para <b>{busqueda}</b>.\n\n"
+                        f"Intenta con tu nombre completo o el nombre de la materia.\n"
+                        f"¿Tienes una duda? Usa /duda para contactar a tu profe.")
  
     return {"ok": True}
  
