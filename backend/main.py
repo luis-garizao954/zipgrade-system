@@ -1669,8 +1669,16 @@ async def webhook_estudiante(request: Request, db: Session = Depends(get_db)):
  
     estudiante = db.query(Estudiante).filter(Estudiante.telegram_id == telegram_id).first()
  
+    # ── PRIORIDAD: si el estudiante está en un grupo activo, los mensajes van al grupo ──
+    # El chat individual solo toma control si el estudiante usó /enviar_profesor explícitamente
+    grupo_activo = get_grupo_activo(db, telegram_id)
     chat_ind_est = get_chat_individual(db, telegram_id)
-    if chat_ind_est and text != "/volver_grupo":
+ 
+    # El chat individual solo aplica si NO hay grupo activo, o si fue iniciado
+    # desde /enviar_profesor (el estudiante lo inició conscientemente)
+    chat_ind_activo = chat_ind_est and not grupo_activo
+ 
+    if chat_ind_activo and text != "/volver_grupo":
         profe_tid_ind, curso_id_ind_est, _desde_est = chat_ind_est
         if incoming_msg_id:
             registrar_msg_chat_individual(db, telegram_id, profe_tid_ind, incoming_msg_id)
@@ -1707,7 +1715,6 @@ async def webhook_estudiante(request: Request, db: Session = Depends(get_db)):
             await send_message(BOT_ESTUDIANTE_TOKEN, chat_id, "No estás en ningún chat individual.")
             return {"ok": True}
  
-    grupo_activo = get_grupo_activo(db, telegram_id)
     if grupo_activo and text != "/salir_grupo" and text != "/grupos" and text != "/duda" and text != "/grafico" and text != "/enviar_profesor" and text != "/misnotas":
         nombre_est = estudiante.nombre if estudiante else nombre
         if voice:
@@ -2147,4 +2154,3 @@ def admin_activar_estudiante(telegram_id: int, db: Session = Depends(get_db)):
 def admin_desactivar_estudiante(telegram_id: int, db: Session = Depends(get_db)):
     desactivar_estudiante(telegram_id, db)
     return {"ok": True}
- 
