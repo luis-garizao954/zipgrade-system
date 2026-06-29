@@ -1009,8 +1009,13 @@ async def webhook_profe(request: Request, db: Session = Depends(get_db)):
  
     profe = db.query(Profe).filter(Profe.telegram_id == telegram_id).first()
  
+    # ── PRIORIDAD: si el profe está en un grupo activo, los mensajes van al grupo ──
+    # El chat individual solo aplica cuando el profe NO está en ningún grupo
+    grupo_activo = get_grupo_activo(db, telegram_id)
     chat_ind = get_chat_individual(db, telegram_id)
-    if chat_ind and text != "/volver_grupo":
+    chat_ind_activo = chat_ind and not grupo_activo
+ 
+    if chat_ind_activo and text != "/volver_grupo":
         estudiante_tid, curso_id_ind, _desde = chat_ind
         if incoming_msg_id:
             registrar_msg_chat_individual(db, telegram_id, estudiante_tid, incoming_msg_id)
@@ -1046,7 +1051,6 @@ async def webhook_profe(request: Request, db: Session = Depends(get_db)):
             await send_message(BOT_PROFE_TOKEN, chat_id, "No estás en ningún chat individual.")
         return {"ok": True}
  
-    grupo_activo = get_grupo_activo(db, telegram_id)
     if grupo_activo and text != "/salir_grupo" and text != "/grupos" and text != "/miembros":
         if voice:
             voice_file_id = voice.get("file_id")
