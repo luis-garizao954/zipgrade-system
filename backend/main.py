@@ -690,32 +690,48 @@ async def transmitir_grupo(db, curso_id, remitente_id, remitente_nombre, es_prof
     prefijo = f"👨‍🏫 <b>[PROFE] {remitente_nombre}:</b>" if es_profe else f"👥 <b>[GRUPO] {remitente_nombre}:</b>"
     curso = db.query(Curso).filter(Curso.id == curso_id).first()
     if not curso:
+        print(f"[transmitir_grupo] ERROR: curso {curso_id} no existe")
         return
-    profe_curso = db.query(Profe).filter(Profe.id == curso.profe_id).first()
-    profe_telegram_id = profe_curso.telegram_id if profe_curso else None
- 
-    # Combinar miembros registrados + miembros con resultados
-    est_ids = get_estudiantes_telegram_ids(db, curso.nombre, profe_telegram_id)
- 
-    # También incluir miembros directos por membresía (por si acaso el nombre no coincide)
-    miembros_directos = obtener_miembros_grupo(db, str(curso_id))
-    for tid in miembros_directos:
-        if tid not in est_ids:
-            est_ids.append(tid)
  
     guardar_mensaje_grupo(db, curso_id, curso.nombre, remitente_nombre, es_profe,
         tipo, contenido=text, file_id=file_id, file_name=file_name)
     if remitente_msg_id:
         registrar_msg_grupo(db, remitente_id, str(curso_id), remitente_msg_id)
+ 
+    # ── DESTINATARIOS: todos los miembros permanentes del grupo ──────────────
+    # Se combinan dos fuentes:
+    # 1. Miembros registrados via __miembro__{curso_id}__{tid} (estudiantes que entraron alguna vez)
+    # 2. El profe dueño del curso (siempre recibe los mensajes de su grupo)
+    tids_vistos = set()
     destinatarios = []
-    for tid in est_ids:
-        if tid != remitente_id:
-            destinatarios.append((BOT_ESTUDIANTE_TOKEN, tid))
-    if profe_telegram_id and profe_telegram_id != remitente_id:
-        destinatarios.append((BOT_PROFE_TOKEN, profe_telegram_id))
+ 
+    # 1. Miembros permanentes (estudiantes que alguna vez entraron)
+    clave_prefix = f"__miembro__{str(curso_id)}__"
+    miembros = db.query(Resultado).filter(
+        Resultado.nombre_temp.like(f"{clave_prefix}%")
+    ).all()
+    for m in miembros:
+        try:
+            tid = int(m.nombre_temp.replace(clave_prefix, ""))
+        except:
+            continue
+        if tid == remitente_id or tid in tids_vistos:
+            continue
+        tids_vistos.add(tid)
+        destinatarios.append((BOT_ESTUDIANTE_TOKEN, tid))
+ 
+    # 2. Profe dueño del curso
+    profe_curso = db.query(Profe).filter(Profe.id == curso.profe_id).first()
+    if profe_curso and profe_curso.telegram_id != remitente_id and profe_curso.telegram_id not in tids_vistos:
+        tids_vistos.add(profe_curso.telegram_id)
+        destinatarios.append((BOT_PROFE_TOKEN, profe_curso.telegram_id))
+ 
     print(f"[transmitir_grupo] curso='{curso.nombre}' remitente={remitente_id} tipo={tipo} | destinatarios={len(destinatarios)} -> {destinatarios}")
+ 
     if not destinatarios:
+        print(f"[transmitir_grupo] Sin destinatarios para este grupo")
         return
+ 
     origen_token = BOT_PROFE_TOKEN if es_profe else BOT_ESTUDIANTE_TOKEN
     async with httpx.AsyncClient(timeout=60) as client:
         for token, chat_id in destinatarios:
@@ -727,6 +743,8 @@ async def transmitir_grupo(db, curso_id, remitente_id, remitente_nombre, es_prof
                     if data.get("ok"):
                         mid = data["result"]["message_id"]
                         registrar_msg_grupo(db, chat_id, str(curso_id), mid)
+                    else:
+                        print(f"[transmitir_grupo] FALLO texto -> {chat_id}: {data}")
                 else:
                     await enviar_media_grupo_con_registro(client, token, chat_id, origen_token, tipo, file_id, file_name, prefijo, db, curso_id)
             except Exception as e:
