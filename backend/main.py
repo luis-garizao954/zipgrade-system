@@ -1743,6 +1743,8 @@ async def webhook_estudiante(request: Request, db: Session = Depends(get_db)):
             return {"ok": True}
  
     if grupo_activo and text != "/salir_grupo" and text != "/grupos" and text != "/duda" and text != "/grafico" and text != "/enviar_profesor" and text != "/misnotas":
+        # Auto-reparación: si tiene grupo activo pero no está registrado como miembro, registrarlo ahora
+        registrar_miembro_grupo(db, str(grupo_activo), telegram_id)
         nombre_est = estudiante.nombre if estudiante else nombre
         if voice:
             await transmitir_grupo(db, grupo_activo, telegram_id, nombre_est, False, "voice",
