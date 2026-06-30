@@ -687,6 +687,7 @@ async def enviar_media_grupo_con_registro(client, token, chat_id, origen_token, 
  
 async def transmitir_grupo(db, curso_id, remitente_id, remitente_nombre, es_profe,
                             tipo, file_id=None, text=None, file_name="archivo", remitente_msg_id=None):
+    print(f"[DEBUG_TRANSMITIR] curso_id={curso_id} remitente_id={remitente_id} remitente_nombre={remitente_nombre} es_profe={es_profe}")
     prefijo = f"👨‍🏫 <b>[PROFE] {remitente_nombre}:</b>" if es_profe else f"👥 <b>[GRUPO] {remitente_nombre}:</b>"
     curso = db.query(Curso).filter(Curso.id == curso_id).first()
     if not curso:
@@ -1700,6 +1701,7 @@ async def webhook_estudiante(request: Request, db: Session = Depends(get_db)):
     # El chat individual solo toma control si el estudiante usó /enviar_profesor explícitamente
     grupo_activo = get_grupo_activo(db, telegram_id)
     chat_ind_est = get_chat_individual(db, telegram_id)
+    print(f"[DEBUG_ESTUDIANTE] telegram_id={telegram_id} text='{text}' grupo_activo={grupo_activo} chat_ind={chat_ind_est}")
  
     # El chat individual solo aplica si NO hay grupo activo, o si fue iniciado
     # desde /enviar_profesor (el estudiante lo inició conscientemente)
