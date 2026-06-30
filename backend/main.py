@@ -698,14 +698,16 @@ async def transmitir_grupo(db, curso_id, remitente_id, remitente_nombre, es_prof
     if remitente_msg_id:
         registrar_msg_grupo(db, remitente_id, str(curso_id), remitente_msg_id)
  
-    # ── DESTINATARIOS: todos los miembros permanentes del grupo ──────────────
-    # Se combinan dos fuentes:
-    # 1. Miembros registrados via __miembro__{curso_id}__{tid} (estudiantes que entraron alguna vez)
-    # 2. El profe dueño del curso (siempre recibe los mensajes de su grupo)
-    tids_vistos = set()
+    tids_vistos = {remitente_id}
     destinatarios = []
  
-    # 1. Miembros permanentes (estudiantes que alguna vez entraron)
+    # 1. El profe dueño del curso SIEMPRE es destinatario (a menos que sea el remitente)
+    profe_curso = db.query(Profe).filter(Profe.id == curso.profe_id).first()
+    if profe_curso and profe_curso.telegram_id not in tids_vistos:
+        tids_vistos.add(profe_curso.telegram_id)
+        destinatarios.append((BOT_PROFE_TOKEN, profe_curso.telegram_id))
+ 
+    # 2. Todos los estudiantes que alguna vez entraron al grupo (membresía permanente)
     clave_prefix = f"__miembro__{str(curso_id)}__"
     miembros = db.query(Resultado).filter(
         Resultado.nombre_temp.like(f"{clave_prefix}%")
@@ -715,16 +717,19 @@ async def transmitir_grupo(db, curso_id, remitente_id, remitente_nombre, es_prof
             tid = int(m.nombre_temp.replace(clave_prefix, ""))
         except:
             continue
-        if tid == remitente_id or tid in tids_vistos:
+        if tid in tids_vistos:
             continue
         tids_vistos.add(tid)
         destinatarios.append((BOT_ESTUDIANTE_TOKEN, tid))
  
-    # 2. Profe dueño del curso
-    profe_curso = db.query(Profe).filter(Profe.id == curso.profe_id).first()
-    if profe_curso and profe_curso.telegram_id != remitente_id and profe_curso.telegram_id not in tids_vistos:
-        tids_vistos.add(profe_curso.telegram_id)
-        destinatarios.append((BOT_PROFE_TOKEN, profe_curso.telegram_id))
+    # 3. Fallback: estudiantes con resultados en este curso (compatibilidad con flujo viejo)
+    if profe_curso:
+        est_ids_legacy = get_estudiantes_telegram_ids(db, curso.nombre, profe_curso.telegram_id)
+        for tid in est_ids_legacy:
+            if tid in tids_vistos:
+                continue
+            tids_vistos.add(tid)
+            destinatarios.append((BOT_ESTUDIANTE_TOKEN, tid))
  
     print(f"[transmitir_grupo] curso='{curso.nombre}' remitente={remitente_id} tipo={tipo} | destinatarios={len(destinatarios)} -> {destinatarios}")
  
